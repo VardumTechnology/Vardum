@@ -1,0 +1,61 @@
+{
+  "version": "v1.1.0",
+  "entity": {
+    "type": "organisation",
+    "role": "owner",
+    "name": "Vardum Technology Pty Ltd",
+    "email": "matt@tryvardum.app",
+    "description": "Australian company building Vardum Messenger, an open-source end-to-end encrypted messenger.",
+    "webpageUrl": {
+      "url": "https://github.com/VardumTechnology"
+    }
+  },
+  "projects": [
+    {
+      "guid": "vardum-messenger",
+      "name": "Vardum Messenger",
+      "description": "Open-source (AGPL-3.0) end-to-end encrypted messenger for iPhone and Android. Post-quantum hybrid encryption (X25519 + ML-KEM-768), no phone number sign-up, sealed-sender delivery and its own relay and call servers. Funding goes to an independent cryptographic audit, planned for early 2027, and the fixes that follow.",
+      "webpageUrl": {
+        "url": "https://github.com/VardumTechnology/Vardum"
+      },
+      "repositoryUrl": {
+        "url": "https://github.com/VardumTechnology/Vardum"
+      },
+      "licenses": [
+        "spdx:AGPL-3.0"
+      ],
+      "tags": [
+        "encryption",
+        "messaging",
+        "privacy",
+        "security",
+        "post-quantum"
+      ]
+    }
+  ],
+  "funding": {
+    "channels": [
+      {
+        "guid": "bank",
+        "type": "bank",
+        "address": "",
+        "description": "Bank transfer to Vardum Technology Pty Ltd. Details on request."
+      }
+    ],
+    "plans": [
+      {
+        "guid": "audit",
+        "status": "active",
+        "name": "Independent cryptographic audit",
+        "description": "Third-party audit of the encryption protocol, apps and relay, plus fixes and a public report.",
+        "amount": 35000,
+        "currency": "USD",
+        "frequency": "one-time",
+        "channels": [
+          "bank"
+        ]
+      }
+    ],
+    "history": []
+  }
+}
