@@ -2,14 +2,14 @@
  * @veil/device — deep-backlog pager with a deletion-safe backfill anchor
  * (audit doc 13, R1).
  *
- * The 1:1 sync (chat.ts, b196) and the forum inbox (lounge.ts, b195-r1) page
+ * The 1:1 sync (chat.ts, b196) and the group inbox (group-session.ts) page
  * the relay NEWEST-FIRST and stop at the first page whose oldest row is
  * already processed. Their old fixed page cap (3 x 50 / 4 x 50) meant a
  * backlog deeper than one pass was never reached: pass 1 took the newest
  * rows, and every later pass stopped at page 0.
  *
  * Both receive paths are also ORDER-SENSITIVE: the 1:1 ratchet keeps at most
- * 100 skipped message keys per chain and the forum replay guard at most 64
+ *  500 skipped message keys per chain (MAX_SKIPPED_PER_CHAIN) and the group replay guard at most 64
  * skipped counters per sender, so decrypting the newest rows of a deep
  * backlog first permanently loses the oldest ones. The backlog therefore has
  * to be processed from its DEEP end, oldest-first.
@@ -28,6 +28,17 @@
  * The caller bounds per-pass work by counting DEFINITIVE outcomes (rows
  * ledgered / marked known), not rows attempted, so rows that stay retryable
  * can't starve newer ones.
+ *
+ * b73 (audit V-01): HELD rows (isHeld) — rows the caller has looked at and can't
+ * process yet, but may later (a future epoch whose rekey hasn't arrived, a sender
+ * whose admission hasn't reached this phone) — end a descent exactly like a
+ * processed row, so a pile of them can never push newer rows past the fetch cap.
+ * Unlike processed rows they are still returned whenever a pass fetches them, so
+ * they are retried. minPages (top-down passes only) makes a pass look at least that
+ * many pages before a processed or held row may stop it: the caller asks for it
+ * once after its trust state changed, so held rows below the first page are
+ * fetched and retried too. Rows the caller REJECTS (unauthenticated, undecryptable,
+ * from no identity it knows) are simply marked processed by the caller.
  */
 
 export interface BackfillAnchor {
@@ -64,11 +75,20 @@ export async function pageBacklog(opts: {
   fetchPage: (skip: number, limit: number) => Promise<Record<string, unknown>[]>;
   /** already definitively processed on this device */
   isKnown: (id: string) => boolean;
+  /** b73 (audit V-01): looked at, not processable yet — stops a descent like a known
+   *  row, but is still returned (retried) when fetched */
+  isHeld?: (id: string) => boolean;
+  /** b73 (audit V-01): top-down only — don't stop on a known/held row before this many
+   *  pages (a re-scan after the caller's trust state changed); kept below maxPages */
+  minPages?: number;
   pageSize: number;
   maxPages: number;
   anchor: BackfillAnchor | null;
 }): Promise<BacklogPage> {
   const { fetchPage, isKnown, pageSize, maxPages } = opts;
+  const isHeld = opts.isHeld ?? (() => false);
+  // b73 (audit V-01): a re-scan never reaches the cap by its own rule (that would return nothing)
+  const minPages = opts.anchor ? 0 : Math.max(0, Math.min(Math.floor(opts.minPages ?? 0), maxPages - 1));
   const anchor = opts.anchor;
   const collected: { row: Record<string, unknown>; pos: number }[] = []; // newest-first
   let pages = 0;
@@ -81,7 +101,8 @@ export async function pageBacklog(opts: {
       if (floor === null || dateOf(row) <= floor) collected.push({ row, pos: at + i });
     });
     const oldestId = idOf(rows[rows.length - 1] ?? {});
-    return rows.length < pageSize || (!!oldestId && isKnown(oldestId));
+    // b73 (audit V-01): a held row ends the descent too (it was looked at already)
+    return rows.length < pageSize || (!!oldestId && (isKnown(oldestId) || isHeld(oldestId)) && pages >= minPages);
   };
 
   if (anchor) {

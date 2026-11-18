@@ -113,6 +113,8 @@ export function ContactsScreen({
   const [lookupInput, setLookupInput] = useState('');
   const [lookupBusy, setLookupBusy] = useState(false);
   const [lookupErr, setLookupErr] = useState<string | null>(null);
+  /** b77q (audit 3 AP-4): an add link filled the field; nothing is looked up until Add is tapped */
+  const [linkNote, setLinkNote] = useState(false);
   const [card, setCard] = useState<LookupResult | null>(null);
   const [sheetFor, setSheetFor] = useState<ContactRow | null>(null);
   const [unpinArm, setUnpinArm] = useState<string | null>(null);
@@ -170,12 +172,14 @@ export function ContactsScreen({
     } finally { setLookupBusy(false); }
   };
 
-  // b199 Veil QR: an opened add link runs the same lookup → safety-code
-  // confirm as typing the ID. Nothing is pinned until the user confirms.
+  // b199 Veil QR: an opened add link fills in the ID for the same lookup → safety-code
+  // confirm as typing it. Nothing is pinned until the user confirms.
+  // b77q (audit 3 AP-4): and nothing is looked up until the user taps Add. Any app on the
+  // phone can open a tryveil.app link in Vardum, so a link that ran the lookup itself let
+  // another app make Vardum ask the relay about IDs of its choosing, signed in as the user.
   React.useEffect(() => {
     if (!prefillAdd?.veilId) return;
-    setLookupInput(prefillAdd.veilId);
-    void doLookup(prefillAdd.veilId);
+    setLookupInput(prefillAdd.veilId); setLookupErr(null); setLinkNote(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefillAdd?.nonce]);
 
@@ -226,12 +230,12 @@ export function ContactsScreen({
             placeholderTextColor="#5E6464"
             value={lookupInput}
             editable={!lookupBusy}
-            onChangeText={(t) => { setLookupInput(t); setLookupErr(null); }}
+            onChangeText={(t) => { setLookupInput(t); setLookupErr(null); setLinkNote(false); }}
           />
           <TouchableOpacity
             style={[styles.addBtn, lookupInput.length < 8 && styles.btnDisabled]}
             disabled={lookupInput.length < 8 || lookupBusy}
-            onPress={() => { void doLookup(); }}
+            onPress={() => { setLinkNote(false); void doLookup(); }}
           >
             {lookupBusy ? <ActivityIndicator color="#0B0B0F" /> : <Text style={styles.addBtnText}>Add</Text>}
           </TouchableOpacity>
@@ -240,6 +244,7 @@ export function ContactsScreen({
             <Ionicons name="qr-code-outline" size={20} color="#FFFFFF" />
           </TouchableOpacity>
         </View>
+        {linkNote ? <Text style={styles.note}>Opened from a link. Tap Add to look up this Vardum ID. Links can come from any app on this phone, so only add IDs you expect.</Text> : null}
         {lookupErr ? <Text style={styles.err}>{lookupErr}</Text> : null}
         {error ? <Text style={styles.err}>{error}</Text> : null}
 
@@ -390,7 +395,7 @@ export function ContactsScreen({
                 ) : null}
                 {groupDone.queued.length ? (
                   <Text style={styles.hint}>
-                    {groupDone.queued.map((v) => nameOf(contacts.find((c) => c.veilId === v) ?? { veilId: v, nickname: null, verified: false, fingerprint: '' })).join(', ')} {groupDone.queued.length === 1 ? 'needs' : 'need'} to accept a chat with you, and you both need to confirm its safety code, first. Their invite will be sent automatically as soon as that’s done. Keep Vardum open for a moment, or it sends next time you open the app.
+                    {groupDone.queued.map((v) => nameOf(contacts.find((c) => c.veilId === v) ?? { veilId: v, nickname: null, verified: false, fingerprint: '' })).join(', ')} {groupDone.queued.length === 1 ? 'needs' : 'need'} to accept a chat with you, and you need to confirm its safety code on this phone, first. Their invite will be sent automatically as soon as that’s done. Keep Vardum open for a moment, or it sends next time you open the app.
                   </Text>
                 ) : null}
                 {groupDone.failed.length ? (

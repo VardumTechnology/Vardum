@@ -7,7 +7,7 @@ Pod::Spec.new do |s|
   s.version        = package['version']
   s.summary        = package['description']
   s.description    = package['description']
-  s.license        = 'Proprietary'
+  s.license        = 'AGPL-3.0-or-later'
   s.author         = 'Vardum'
   s.homepage       = 'https://veil.privacy'
   s.platforms      = { :ios => '15.1' }

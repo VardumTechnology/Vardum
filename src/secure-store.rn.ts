@@ -19,11 +19,15 @@
  * prompting on every message, so the gate is scoped to the identity keyvault
  * only — a deliberate, honest scoping decision, not the full-store gate the
  * web copy's wording alone might suggest.
- */
+ */
+import { writeKeychainVerified, type KeychainLike } from './keychain-write'; // b77u (audit 6 R1 F-05)
 import * as Keychain from 'react-native-keychain';
 import { Platform } from 'react-native';
 import type { SecureStore } from '../vendor/device/src/index';
 import { AUTH_SESSION_KEY } from '../vendor/device/src/auth';
+import { NAR_MARKER_KEY } from '../vendor/device/src/keyvault'; // b77m review (M1)
+import { WRONG_IN_A_ROW_KEY } from '../vendor/device/src/applock';
+import { ContainerKeyStore, ckBlindable, CK_RAW_KEYS, CK_MEDIA_KEYS, CK_KEPT_KEYS, CK_FAIL_CLOSED_KEYS, CK_KEPT_SLOT, CK_SEALED_SLOT, type ContainerKeyFiles } from '../vendor/device/src/container-key';
 
 /**
  * b81 (owner report: "no notifications, locked or unlocked" — confirmed
@@ -44,6 +48,17 @@ import { AUTH_SESSION_KEY } from '../vendor/device/src/auth';
  * unchanged. Losing this token to a live, already-unlocked-since-boot
  * seizure only exposes the account login — never message content or key
  * material, which stay independently gated exactly as before.
+ *
+ * b73 (audit V-12): the accessible tiers above are an iOS Keychain feature.
+ * react-native-keychain 8 on Android ignores them: items are encrypted with an
+ * Android Keystore key (AES-CBC, no MAC, no setUnlockedDeviceRequired), so on
+ * Android they are readable by the app whenever it runs, locked screen or not.
+ * Moving to an authenticated, unlock-bound Keystore cipher needs a keychain
+ * library upgrade; it is a known limit until then (Settings says the app lock
+ * is not encryption).
+ * b75 (audit AL-6 / V7): every value is now sealed above that layer with AES-GCM
+ * under the container key (ContainerKeyStore below), whose file on Android is
+ * itself sealed by a Keystore key bound to an unlocked phone where supported.
  */
 const AUTH_TOKEN_ACCESSIBLE = Keychain.ACCESSIBLE.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY;
 
@@ -158,8 +173,127 @@ function isUnreadableEntry(e: unknown): boolean {
 }
 const unreadableLogged = new Set<string>();
 
+/** b70 (audit VAR-13): the lock records fail CLOSED. An unreadable lock or
+ *  lockout record must read as "locked", never as "no lock set", so these
+ *  keys throw instead of reading as missing. */
+// b71 (review): the two key-index copies too. Read as missing, the next save
+// rewrote the index with one entry and wipes then missed every other key; now
+// KeychainStorage sees the failure and rebuilds the index from list().
+export const FAIL_CLOSED_KEYS = new Set(['veil_app_lock', 'veil_lockout', 'veil_app_lock_key', 'veil_keychain_index', 'veil_keychain_index_b']);
+// b75 (audit AL-1): the wrong-in-a-row row too. Missing, it now counts as tampering, so
+// an unreadable one must throw (the lock reads as locked) instead of reading as missing.
+FAIL_CLOSED_KEYS.add(WRONG_IN_A_ROW_KEY);
+// b75 round 2 (audit D10): the settings too. An altered or unreadable record used to read as
+// missing, which meant the unprotected defaults (self-destruct off, erase-after-10 off,
+// history on); now it throws and SettingsStore turns every protection on (App.tsx says so).
+FAIL_CLOSED_KEYS.add('veil_settings_v1');
+// b75 round 3 (audit DV-7 / DV-8): and every key the sealing layer treats as fail-closed (the
+// decoy push hold, the notes' rollback marks): one list, CK_FAIL_CLOSED_KEYS (spec §6.2)
+for (const k of CK_FAIL_CLOSED_KEYS) FAIL_CLOSED_KEYS.add(k);
+
+/** b75 (audit AL-6): the native container-key files (modules/veil-crypto ck*), or null
+ *  on a binary without them (values then stay as they are, unsealed). */
+interface NativeCk {
+  /** null (Android) or {} (iOS) when the slot has no file */
+  ckRead?: (slot: string) => Promise<{ key?: string; gen?: number } | null>;
+  ckCreate?: (slot: string, gen: number) => Promise<{ key: string; gen: number }>;
+  ckRemove?: (slot: string) => Promise<boolean>;
+  ckRemoveAll?: () => Promise<boolean>;
+  /** b75 round 2 (audit I1): delete the Keystore wrap key when no slot file is left */
+  ckDropWrapIfIdle?: () => Promise<boolean>;
+  /** b75 round 3 (audit DV-11): Android, re-seal the slot files under a wrap key bound to an
+   *  unlocked phone once the phone has a screen lock (true = bound) */
+  ckRebindUnlocked?: () => Promise<boolean>;
+  ckInfo?: () => { hardware: boolean; unlockBound: boolean };
+  seDeleteKey?: () => Promise<boolean>;
+}
+function nativeCk(): NativeCk | null {
+  const m = nativeSe() as unknown as NativeCk | null;
+  return m && typeof m.ckRead === 'function' && typeof m.ckCreate === 'function' && typeof m.ckRemove === 'function' ? m : null;
+}
+export function nativeContainerKeyFiles(): ContainerKeyFiles | null {
+  const m = nativeCk();
+  if (!m) return null;
+  return {
+    read: async (slot) => {
+      const r = await m.ckRead!(slot);
+      return r && typeof r.key === 'string' ? { key: r.key, gen: Number(r.gen) } : null;
+    },
+    create: async (slot, gen) => {
+      const r = await m.ckCreate!(slot, gen);
+      return { key: r.key, gen: Number(r.gen) };
+    },
+    remove: async (slot) => {
+      if (!(await m.ckRemove!(slot))) throw new Error('container key file could not be deleted');
+    },
+    // b75 round 2 (audit I1): a full wipe leaves no Vardum Keystore key behind (older
+    // binaries without the function keep it, as before)
+    dropWrapKeyIfIdle: m.ckDropWrapIfIdle ? async () => { await m.ckDropWrapIfIdle!(); } : undefined,
+  };
+}
+/** b75 (AL-6): is there a container key on this install (the fresh-install guard's signal).
+ *  b75 round 3 (audit DV-4): the kept slot and the sealed-install file count too. After a
+ *  Nothing-at-Rest close wipe only those are left; with the launch flag lost as well, the
+ *  guard used to take the phone for a reinstall and sweep the very records the wipe kept.
+ *  (A reinstall on iOS has none of these files: they went with the old app.) */
+export async function containerKeyPresent(): Promise<boolean> {
+  const f = nativeContainerKeyFiles();
+  if (!f) return false;
+  for (const s of CONTAINER_KEY_SIGNAL_SLOTS) { try { if (await f.read(s)) return true; } catch { return true; /* present but unreadable now */ } }
+  return false;
+}
+/** b75 round 3 (audit DV-4): the slots whose file means "this install wrote data since its
+ *  last wipe" (the media slot can outlive a full wipe until its files are deleted) */
+export const CONTAINER_KEY_SIGNAL_SLOTS: readonly string[] = ['a', 'b', CK_KEPT_SLOT, CK_SEALED_SLOT];
+/** b75 round 3 (audit DV-11): Android. A phone that had no screen lock when Vardum first made
+ *  its container wrap key got one that works while the phone is locked; once it has a screen
+ *  lock, the next launch binds the key files to an unlocked phone. Best-effort; older
+ *  binaries and iOS (which has no such key) do nothing. */
+export async function rebindContainerKey(): Promise<boolean> {
+  try { return !!(await nativeCk()?.ckRebindUnlocked?.()); } catch { return false; }
+}
+/** b75 (AL-6 / AL-10): every container-key file (a fresh install's sweep) */
+export async function removeAllContainerKeys(): Promise<void> {
+  try { await nativeCk()?.ckRemoveAll?.(); } catch { /* best-effort */ }
+}
+// b75 (audit DEV-I6): containerKeyInfo() was removed: nothing read it, and its iOS answer
+// was a constant. The native ckInfo stays as a diagnostic (Android: whether the file's
+// wrap key is in secure hardware and bound to an unlocked phone; iOS: always false,
+// since the file is protected only by iOS file protection, readable after first unlock).
+/** b75 (audit AL-10): delete the security-chip wrap key without making a new one
+ *  (older binaries: reset it, which is what they did before) */
+export async function deleteSecureEnclaveKey(): Promise<void> {
+  const m = nativeCk();
+  if (m?.seDeleteKey) { try { await m.seDeleteKey(); } catch { /* best-effort */ } return; }
+  if (secureEnclaveAvailable()) await resetSecureEnclaveKey().catch(() => false);
+}
+
+/** b70 (VAR-13): keys that read as missing because they were unreadable this
+ *  launch (the app tells the user rather than resetting them silently) */
+export function unreadableKeysThisLaunch(): string[] {
+  return [...unreadableLogged];
+}
+
 export function createRnSecureStore(opts: RnSecureStoreOptions = {}): SecureStore {
-  const direct = createDirectStore(opts);
+  const plain = createDirectStore(opts);
+  // b75 (audit AL-6): every value sealed under the container key, below the read cache
+  const files = nativeContainerKeyFiles();
+  const direct: SecureStore = files
+    ? new ContainerKeyStore(plain, files, {
+      raw: (k) => CK_RAW_KEYS.has(k),
+      media: (k) => CK_MEDIA_KEYS.has(k),
+      kept: (k) => CK_KEPT_KEYS.has(k), // b75 round 2 (audit D1 / D8): their own slot
+      failClosed: (k) => FAIL_CLOSED_KEYS.has(k),
+      // re-sealing the hardware-gated identity in the background would ask for a
+      // fingerprint on Android; it is re-sealed at its next deliberate save instead
+      noLazyMigrate: (k) => k === HARDWARE_GATED_KEY && !!opts.isHardwareGated?.(),
+      // b77p (audit 2, VAR-15): record names blinded and the key index sealed, so an extraction
+      // can't list chat / group / mailbox identifiers from the platform store
+      blindNames: ckBlindable,
+      sealIndex: true,
+      log: (m) => console.log(m),
+    })
+    : plain;
   if (!CACHE_ON) return direct;
   return {
     async get(key) {
@@ -173,7 +307,7 @@ export function createRnSecureStore(opts: RnSecureStoreOptions = {}): SecureStor
         try {
           value = await direct.get(key);
         } catch (e) {
-          if (!isUnreadableEntry(e)) throw e;
+          if (!isUnreadableEntry(e) || FAIL_CLOSED_KEYS.has(key)) throw e;
           if (!unreadableLogged.has(key)) {
             unreadableLogged.add(key);
             console.log(`[veil-secure] unreadable entry treated as missing: ${key}`);
@@ -198,7 +332,37 @@ export function createRnSecureStore(opts: RnSecureStoreOptions = {}): SecureStor
       try { await direct.delete(key); } finally { bump(key); }
       cache.set(key, null);
     },
+    list: () => direct.list!(),
+    // b75 (AL-6): straight to the sealing layer (the cached plaintext is what this
+    // process already holds; the wipes delete those keys right after)
+    present: direct.present ? (k) => direct.present!(k) : undefined,
+    shred: direct.shred ? () => direct.shred!() : undefined,
+    rotate: direct.rotate ? (keep) => direct.rotate!(keep) : undefined,
+    shredMedia: direct.shredMedia ? () => direct.shredMedia!() : undefined,
+    sealAll: direct.sealAll ? (keys, pauseMs, out) => direct.sealAll!(keys, pauseMs, out) : undefined,
+    // b75 (audit DEV-L1 / DEV-I2): the wipe mode and the zero-fill size go to the sealing
+    // layer (the cache holds plaintext the process already has; it never sizes a wipe)
+    plainLength: direct.plainLength ? (k) => direct.plainLength!(k) : undefined,
+    beginWipe: direct.beginWipe ? () => direct.beginWipe!() : undefined,
+    endWipe: direct.endWipe ? () => direct.endWipe!() : undefined,
+    needsSeal: direct.needsSeal ? (k) => direct.needsSeal!(k) : undefined,
+    homeKept: direct.homeKept ? (l) => direct.homeKept!(l) : undefined, // b75 round 2 (audit D1)
+    // b75 round 3 (audit DV-1 / DV-2): the sealed-install state, and the wipe's zero-fill (the
+    // cached copy is dropped: the entry is about to go)
+    sealedInstall: direct.sealedInstall ? () => direct.sealedInstall!() : undefined,
+    sealInstall: direct.sealInstall ? (k) => direct.sealInstall!(k) : undefined,
+    zeroFill: direct.zeroFill ? async (key) => {
+      bump(key);
+      cache.delete(key);
+      try { await direct.zeroFill!(key); } finally { bump(key); }
+    } : undefined,
   };
+}
+
+/** b71 (review): the keys the platform store really holds (services are "veil.<key>") */
+async function listStoredKeys(): Promise<string[]> {
+  const services = await Keychain.getAllGenericPasswordServices();
+  return services.filter((sv) => sv.startsWith('veil.')).map((sv) => sv.slice('veil.'.length));
 }
 
 function createDirectStore(opts: RnSecureStoreOptions): SecureStore {
@@ -252,64 +416,24 @@ function createDirectStore(opts: RnSecureStoreOptions): SecureStore {
       }
       const opts_: Parameters<typeof Keychain.setGenericPassword>[2] = {
         service: `veil.${key}`,
-        accessible: key === AUTH_SESSION_KEY ? AUTH_TOKEN_ACCESSIBLE : Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+        // b77m review (M1): the one-bit Nothing-at-Rest marker must be readable on a background launch too
+        // (the cold-boot wipe decides by it when the sealed records answer "User interaction is not allowed")
+        accessible: key === AUTH_SESSION_KEY || key === NAR_MARKER_KEY ? AUTH_TOKEN_ACCESSIBLE : Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         ...(gated ? {
           accessControl: Keychain.ACCESS_CONTROL.BIOMETRY_CURRENT_SET,
           securityLevel: Keychain.SECURITY_LEVEL.SECURE_HARDWARE,
         } : {}),
       };
-      try {
-        await Keychain.setGenericPassword('veil', value, opts_);
-      } catch (e) {
-        // AUDIT FIX (Sept 19): iOS Keychain cannot change an existing item's
-        // accessControl in place (SecItemUpdate ignores it) — flipping Key
-        // storage to/from "Locked in your phone's security chip" re-writes
-        // the SAME service with different attributes, which iOS rejects with
-        // "the user name or passphrase you entered is not correct" (-25293),
-        // even though the passphrase never changed. The record then goes
-        // half-written, and every LATER read of it fails the same way.
-        // Fix: on any set() failure, delete the stale item and retry once
-        // fresh — this is the only way to change accessControl on iOS.
-        try {
-          await Keychain.resetGenericPassword({ service: `veil.${key}` });
-          await Keychain.setGenericPassword('veil', value, opts_);
-        } catch (e2) {
-          diag('set', key, e2);
-        }
-      // b196-r7 (owner repro Oct 12, delete+reinstall+24-word restore:
-      // "The forum posting session is not ready — try joining again"):
-      // setGenericPassword can RESOLVE successfully while the item never
-      // lands — a fresh-install keychain flake. The session join then saves,
-      // reads back three lines later, finds nothing, and the join dies. A
-      // keychain write that claims success must VERIFY: read the item back,
-      // and if it is missing, delete + rewrite once. Still missing -> honest
-      // readable failure (surfaced by KeychainStorage as a logged set-false)
-      // instead of a downstream "not ready" mystery. Gated (SE / biometric)
-      // keys are exempt: reading those back would prompt the user.
-      if (!gated) {
-        const rb = await Keychain.getGenericPassword({ service: `veil.${key}` });
-        const rbVal = (rb && typeof rb === 'object' ? (rb as { password?: string }).password : undefined);
-        if (rbVal !== value) {
-          console.error('[veil-secure] write did not persist (read-back mismatch) — retrying once:', key);
-          try {
-            await Keychain.resetGenericPassword({ service: `veil.${key}` });
-            await Keychain.setGenericPassword('veil', value, opts_);
-          } catch (e3) {
-            diag('set', key, e3);
-          }
-          const rb2 = await Keychain.getGenericPassword({ service: `veil.${key}` });
-          if ((rb2 && typeof rb2 === 'object' ? (rb2 as { password?: string }).password : undefined) !== value) {
-            diag('set', key, new Error('keychain write did not persist (verified read-back)'));
-          }
-        }
-      }
-      }
+      // b77u (audit 6 R1 F-05): a write that resolves false is a failed write, and the read-back runs after the whole
+      // write (it sat inside the catch, so a normal write never checked); gated keys are still never read back
+      await writeKeychainVerified(Keychain as unknown as KeychainLike, key, value, opts_ as { service: string } & Record<string, unknown>, gated, diag);
     },
     async delete(key) {
       try {
         await Keychain.resetGenericPassword({ service: `veil.${key}` });
       } catch (e) { diag('delete', key, e); }
     },
+    list: listStoredKeys,
   };
 }
 
@@ -322,13 +446,41 @@ function createDirectStore(opts: RnSecureStoreOptions): SecureStore {
  * lives at the SE key-use inside seUnwrap(). On the LEGACY gated-entry path
  * (no Secure Enclave) this read prompts exactly like any gated read.
  */
-export async function keyvaultEntrySealed(): Promise<'sealed' | 'plain' | 'missing'> {
+export async function keyvaultEntrySealed(): Promise<'sealed' | 'plain' | 'missing' | 'error'> {
   try {
     const rc = await Keychain.getGenericPassword({ service: `veil.${HARDWARE_GATED_KEY}` });
     if (!rc) return 'missing';
     const stored = (rc as { password: string }).password;
     return isSeWrapped(stored) ? 'sealed' : 'plain';
-  } catch { return 'missing'; }
+  } catch {
+    // b77t2 (CL-5): a read that THREW (a transient Keychain error, "interaction not allowed") says nothing about
+    // the entry. It used to read as 'missing', and the boot then reset the Secure Enclave key under a sealed entry
+    return 'error';
+  }
+}
+
+/** b77t2 (CL-5): hardware protection of the identity entry, three ways — 'protected' (confirmed), 'unprotected'
+ *  (confirmed plain or confirmed absent) or 'unknown' (the check itself failed: nothing may be reset or rewritten
+ *  on this answer) */
+export async function keyvaultProtectionState(): Promise<'protected' | 'unprotected' | 'unknown'> {
+  if (secureEnclaveAvailable()) {
+    const st = await keyvaultEntrySealed();
+    return st === 'sealed' ? 'protected' : st === 'error' ? 'unknown' : 'unprotected';
+  }
+  try { return (await listStoredKeys()).includes(HARDWARE_GATED_KEY) ? 'protected' : 'unprotected'; } catch { return 'unknown'; }
+}
+
+/**
+ * b77t (audit 5 M-A, R4 F-01): an AFFIRMATIVE, prompt-free check that hardware mode really protects the
+ * identity entry. 'missing' used to pass (b77p stored the entry under a blinded name, where set() never
+ * applied the Secure Enclave wrap or the biometric access control, and the probe of the literal name
+ * answered 'missing', which nobody treated as a failure). Now only a positive answer counts:
+ *  - with a Secure Enclave: the literal entry holds an SE-sealed blob ('sealed');
+ *  - without one (the biometric-gated keychain entry): the literal entry exists. Its value can't be read
+ *    without a prompt, but set() puts the access control on every write of that name in hardware mode.
+ */
+export async function keyvaultHardwareProtected(): Promise<boolean> {
+  return (await keyvaultProtectionState()) === 'protected';
 }
 
 /** b62: is the Secure Enclave path usable on this device? (true hardware mode

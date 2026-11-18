@@ -1,7 +1,7 @@
 /**
  * @veil/crypto-core — KDF helpers (WebCrypto only).
  * Semantics extracted from the live bundle:
- *  - hkdf(ikm, salt, info, len)            -> HKDF-SHA256 expand
+ *  - hkdf(ikm, salt, info, len)            -> HKDF-SHA256 (RFC 5869 extract-then-expand)
  *  - advanceChain(chain)                   -> HMAC-SHA256 with label bytes
  *      mk = HMAC(chain, [0x01]), ck' = HMAC(chain, [0x02])
  *  - bip39Seed(words)                      -> PBKDF2-SHA-512, salt 'mnemonic', 2048 iters, 512 bits

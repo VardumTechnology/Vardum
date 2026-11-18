@@ -14,6 +14,9 @@ export * from './identity';
 export * from './mlkem';
 export * from './padding';
 export * from './ratchet';
+export * from './delivery'; // b77 sealed sender
+export * from './wake'; // b77p (audit 2 VAR-01)
+export * from './open-token'; // b77p (audit 2 VAR-01)
 export * from './storage-adapter';
 export * from './vault';
 

@@ -97,7 +97,7 @@ async function testPbkdf2Path(): Promise<string> {
  *  If this passes but extracting a Photos-saved image fails, the Photos
  *  save/load path altered the file, not the stego code. */
 async function testStegoRoundtrip(): Promise<string> {
-  const { buildStegoStream, lsbEmbed, extractStego } = await import('./stego');
+  const { buildStegoStream, lsbEmbed, extractStego, embedStego } = await import('./stego');
   const { decodePng, encodePng } = await import('./png');
   const msg = 'veil-stego-selftest-' + Date.now() + ' — the words travel inside, invisible.';
   const pass = 'stego-selftest-passphrase';
@@ -106,7 +106,7 @@ async function testStegoRoundtrip(): Promise<string> {
   // pseudo-random carrier (deterministic so failures are reproducible)
   for (let i = 0; i < rgba.length; i++) rgba[i] = (i * 31 + 7) & 0xff;
   for (let p = 3; p < rgba.length; p += 4) rgba[p] = 255;
-  lsbEmbed(rgba, await buildStegoStream(msg, pass));
+  await embedStego(rgba, msg, pass); // b75 (audit VS-1): passphrase images are v3
   const png = encodePng({ width: W, height: H, rgba });
   const again = decodePng(new Uint8Array(png));
   if (again.width !== W || again.height !== H) throw new Error(`png decode size mismatch (${again.width}x${again.height})`);

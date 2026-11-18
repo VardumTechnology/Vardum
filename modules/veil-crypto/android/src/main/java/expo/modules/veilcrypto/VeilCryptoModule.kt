@@ -61,6 +61,8 @@ class VeilCryptoModule : Module() {
   private val mainHandler = Handler(Looper.getMainLooper())
 
   private var captureCallback: Activity.ScreenCaptureCallback? = null
+  /** b77q (audit 3 AP-3): the pending native clipboard clear (touched on the main thread only) */
+  private var clipClear: Runnable? = null
 
   override fun definition() = ModuleDefinition {
     Name("VeilCrypto")
@@ -187,7 +189,7 @@ class VeilCryptoModule : Module() {
         if (iv.size != 12) throw CodedException("ERR_BAD_IV", "aesGcmEncrypt: iv must be 12 bytes", null)
         val pt = b64ToBytes(plaintextBase64)
           ?: throw CodedException("ERR_BAD_INPUT", "aesGcmEncrypt: invalid base64 plaintext", null)
-        val aad = hexToBytes(aadHex)
+        val aad = strictHexToBytes(aadHex) // b77t (audit 5 L-31): malformed AAD hex is refused, never read as no AAD
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
         if (aad.isNotEmpty()) cipher.updateAAD(aad)
@@ -214,7 +216,7 @@ class VeilCryptoModule : Module() {
         if (combined.size < 16) {
           throw CodedException("ERR_BAD_INPUT", "aesGcmDecrypt: ciphertext shorter than a bare GCM tag", null)
         }
-        val aad = hexToBytes(aadHex)
+        val aad = strictHexToBytes(aadHex) // b77t (audit 5 L-31): malformed AAD hex is refused, never read as no AAD
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
         if (aad.isNotEmpty()) cipher.updateAAD(aad)
@@ -334,6 +336,113 @@ class VeilCryptoModule : Module() {
       }
     }
 
+    // ---------- App-lock MAC (b70 audit fix VAR-07) ----------
+    // The app-lock verifier is HMAC(key, PBKDF2(code)) with a non-exportable
+    // Keystore HMAC key (StrongBox where available, no user auth so the lock
+    // screen works without a fingerprint). A copied lock record can't be
+    // guessed offline: every guess needs this phone's Keystore.
+    // "The Keystore can make and use the lock's HMAC key" — records made with it
+    // keep using it (mac: 'hw'). b75 (audit AL-11): whether that key really sits in
+    // secure hardware is a separate question, answered by lockMacHardware below.
+    Function("lockMacAvailable") { true }
+
+    // b75 (audit AL-11): true only when the lock key is inside secure hardware
+    // (TEE or StrongBox) by its KeyInfo. It used to be assumed on every Android
+    // phone; a software-only Keystore now reports false, and the app tells the user.
+    Function("lockMacHardware") {
+      try { keyInsideSecureHardware(loadLockMacKey()) } catch (e: Exception) { false }
+    }
+
+    AsyncFunction("lockMac") { inputHex: String, promise: Promise ->
+      try {
+        val input = hexToBytes(inputHex)
+        if (input.isEmpty()) throw CodedException("ERR_LOCK_INPUT", "lockMac: input is not valid hex", null)
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(loadLockMacKey())
+        promise.resolve(bytesToHex(mac.doFinal(input)))
+      } catch (e: CodedException) {
+        promise.reject(e)
+      } catch (e: Exception) {
+        promise.reject("ERR_LOCK", "lockMac failed: ${e.message}", e)
+      }
+    }
+
+    // b71 (audit): copy text marked sensitive — Android 13+ then shows no preview
+    // of it in the clipboard overlay, and keyboards keep it out of their clipboard
+    // history. b77q (audit 3 AP-3): and it is cleared natively after expireSeconds. The JS
+    // timer that used to do it alone is paused with the activity, so a copy taken into another
+    // app stayed until Vardum came back. A Handler on the main looper still runs while the
+    // activity is paused (not after the process dies). Android withholds the clipboard from a
+    // background app, so when it can't be read it is cleared without the "still ours" check.
+    // b77s (audit 4 A-01): every wipe drops the app's cookies. React Native's networking keeps them
+    // in the WebView CookieManager store (ForwardingCookieHandler), so a relay that set one could link
+    // requests made before and after a wipe. Best-effort: resolves false when it can't run.
+    // (Not compiled in the b77s round: no Android toolchain there; needs a device build check.)
+    AsyncFunction("clearCookies") { promise: Promise ->
+      Handler(Looper.getMainLooper()).post {
+        try {
+          val cm = android.webkit.CookieManager.getInstance()
+          cm.removeAllCookies { _ ->
+            try { cm.flush() } catch (e: Exception) { }
+            promise.resolve(true)
+          }
+        } catch (e: Exception) {
+          promise.resolve(false)
+        }
+      }
+    }
+
+    AsyncFunction("setSensitiveClipboard") { text: String, expireSeconds: Double, promise: Promise ->
+      val ctx = appContext.reactContext?.applicationContext
+      if (ctx == null) {
+        promise.reject("ERR_CLIP", "setSensitiveClipboard: no context", null)
+        return@AsyncFunction
+      }
+      Handler(Looper.getMainLooper()).post {
+        try {
+          val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+          val clip = android.content.ClipData.newPlainText("Vardum", text)
+          val extras = android.os.PersistableBundle()
+          // the constant is API 33; older versions read the same literal key
+          extras.putBoolean(if (Build.VERSION.SDK_INT >= 33) android.content.ClipDescription.EXTRA_IS_SENSITIVE else "android.content.extra.IS_SENSITIVE", true)
+          clip.description.extras = extras
+          cm.setPrimaryClip(clip)
+          // b77q (audit 3 AP-3): the delayed native clear (a newer copy replaces the pending one)
+          clipClear?.let { mainHandler.removeCallbacks(it) }
+          val clear = Runnable {
+            clipClear = null
+            try {
+              val cur = cm.primaryClip // null when Android withholds it (Vardum in the background)
+              val ours = cur == null || (cur.itemCount > 0 && cur.getItemAt(0).text?.toString() == text)
+              if (ours) {
+                if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip()
+                else cm.setPrimaryClip(android.content.ClipData.newPlainText("", ""))
+              }
+            } catch (e: Exception) { /* best-effort */ }
+          }
+          clipClear = clear
+          mainHandler.postDelayed(clear, ((if (expireSeconds > 0) expireSeconds else 60.0) * 1000).toLong())
+          promise.resolve(true)
+        } catch (e: Exception) {
+          promise.reject("ERR_CLIP", "setSensitiveClipboard failed: ${e.message}", e)
+        }
+      }
+    }
+
+    AsyncFunction("lockMacReset") { promise: Promise ->
+      try {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        if (ks.containsAlias(LOCK_KEY_ALIAS)) ks.deleteEntry(LOCK_KEY_ALIAS)
+        promise.resolve(true)
+      } catch (e: Exception) {
+        promise.reject("ERR_LOCK", "lockMacReset failed: ${e.message}", e)
+      }
+    }
+
+    // Time since boot, counting deep sleep. Changing the phone's clock doesn't
+    // move it, so lockouts can't be skipped that way.
+    Function("uptimeMs") { android.os.SystemClock.elapsedRealtime().toDouble() }
+
     // D-20 (RV-57): report where the wrap key lives without using it (no
     // prompt). New, optional: JS that doesn't call it is unaffected. Creates
     // the key if missing, like seWrapKey would.
@@ -345,6 +454,194 @@ class VeilCryptoModule : Module() {
         promise.reject("ERR_SE", "seKeyInfo failed: ${e.message}", e)
       }
     }
+
+    // ---------- b75 (audit AL-10): delete the security-chip wrap key outright ----------
+    // A wipe used seResetKey, which makes a fresh key straight away, so a wiped
+    // phone still held a Vardum Keystore key. This deletes it and makes none.
+    AsyncFunction("seDeleteKey") { promise: Promise ->
+      try {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        if (ks.containsAlias(SE_KEY_ALIAS)) ks.deleteEntry(SE_KEY_ALIAS)
+        promise.resolve(!KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.containsAlias(SE_KEY_ALIAS))
+      } catch (e: Exception) {
+        promise.reject("ERR_SE", "seDeleteKey failed: ${e.message}", e)
+      }
+    }
+
+    // ---------- b75 (audit AL-6): container keys ----------
+    // Every secure-store value is AES-GCM sealed (in JS) under a random 256-bit key
+    // kept in a file in this app's no-backup directory. The file holds that key
+    // sealed again under a Keystore AES key that, where the phone supports it, works
+    // only while the phone is unlocked (setUnlockedDeviceRequired, API 28+). JS reads
+    // the key once per process (the phone is unlocked when Vardum is opened) and keeps
+    // it in memory, so receiving in the background keeps working; a copy of the store
+    // taken from a locked phone can't be opened with this file. Deleting the file is
+    // the crypto-shred every wipe does first.
+    // File: [ver=1][gen:4 BE][iv:12][ct||tag of the 32-byte key], AAD "vardum-ck|<slot>|<gen>".
+    // b75 round 3 (audit DV-11): every container-key file operation runs under one lock, so
+    // the re-binding below (which re-writes the files) can never race a wipe's delete (and
+    // put a destroyed key back) or a read that picks the wrap key from the file's version.
+    AsyncFunction("ckRead") { slot: String, promise: Promise ->
+      synchronized(ckLock) {
+        try {
+          val f = ckFile(slot)
+          if (!f.exists()) { promise.resolve(null); return@AsyncFunction }
+          val bytes = f.readBytes()
+          // b75 round 3 (DV-11): the version byte names the wrap key (1: the first one,
+          // 2: the one made later, bound to an unlocked phone)
+          val alias = if (bytes.size == 1 + 4 + 12 + 32 + 16) ckAliasFor(bytes[0]) else null
+          if (alias == null) {
+            throw CodedException("ERR_CK_BAD", "container key file is malformed", null)
+          }
+          val gen = java.nio.ByteBuffer.wrap(bytes, 1, 4).int
+          val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+          if (!ks.containsAlias(alias)) {
+            // the Keystore key that sealed this file is gone (app data restored onto a
+            // phone without it): the file can never open again — it is garbage
+            ckShredFile(f)
+            promise.resolve(null)
+            return@AsyncFunction
+          }
+          val key = (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+            ?: throw CodedException("ERR_CK_UNAVAILABLE", "container wrap key unavailable", null)
+          val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+          val plain = try {
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, bytes.copyOfRange(5, 17)))
+            cipher.updateAAD("vardum-ck|$slot|$gen".toByteArray(Charsets.UTF_8))
+            cipher.doFinal(bytes.copyOfRange(17, bytes.size))
+          } catch (e: javax.crypto.AEADBadTagException) {
+            throw CodedException("ERR_CK_BAD", "container key file failed its check", null)
+          } catch (e: Exception) {
+            // e.g. the phone is locked and the key is bound to an unlocked phone: try later
+            throw CodedException("ERR_CK_UNAVAILABLE", "container key can't be opened right now: ${e.javaClass.simpleName}", null)
+          }
+          try { promise.resolve(mapOf("key" to bytesToB64(plain), "gen" to gen)) } finally { plain.fill(0) }
+        } catch (e: CodedException) {
+          promise.reject(e)
+        } catch (e: Exception) {
+          promise.reject("ERR_CK", "ckRead failed: ${e.message}", e)
+        }
+      }
+    }
+
+    AsyncFunction("ckCreate") { slot: String, gen: Int, promise: Promise ->
+      synchronized(ckLock) {
+        try {
+          val f = ckFile(slot)
+          // never overwrite: a key in use is only ever replaced by remove + create
+          if (f.exists()) throw CodedException("ERR_CK_EXISTS", "container key slot is in use", null)
+          // b75 round 3 (DV-11): the unlock-bound key made later, once there is one
+          val ksNow = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+          val bound = if (ksNow.containsAlias(CK_WRAP_ALIAS_U)) (ksNow.getEntry(CK_WRAP_ALIAS_U, null) as? KeyStore.SecretKeyEntry)?.secretKey else null
+          val wrap = bound ?: ckWrapKey()
+          val ver = if (bound != null) CK_VERSION_U else CK_VERSION
+          val raw = ByteArray(32).also { SecureRandom().nextBytes(it) }
+          try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, wrap)
+            cipher.updateAAD("vardum-ck|$slot|$gen".toByteArray(Charsets.UTF_8))
+            val ct = cipher.doFinal(raw)
+            val iv = cipher.iv
+            if (iv.size != 12 || ct.size != 48) throw CodedException("ERR_CK", "unexpected GCM sizes", null)
+            val out = java.nio.ByteBuffer.allocate(1 + 4 + 12 + 48).put(ver).putInt(gen).put(iv).put(ct).array()
+            // durable before it is used: temp file, fsync, rename, fsync the directory
+            val tmp = java.io.File(f.parentFile, "${f.name}.tmp")
+            java.io.FileOutputStream(tmp).use { os -> os.write(out); os.flush(); os.fd.sync() }
+            if (!tmp.renameTo(f)) { tmp.delete(); throw CodedException("ERR_CK", "container key file could not be placed", null) }
+            ckSyncDir(f.parentFile!!)
+            promise.resolve(mapOf("key" to bytesToB64(raw), "gen" to gen))
+          } finally {
+            raw.fill(0)
+          }
+        } catch (e: CodedException) {
+          promise.reject(e)
+        } catch (e: Exception) {
+          promise.reject("ERR_CK", "ckCreate failed: ${e.message}", e)
+        }
+      }
+    }
+
+    AsyncFunction("ckRemove") { slot: String, promise: Promise ->
+      synchronized(ckLock) {
+        try {
+          val f = ckFile(slot)
+          ckShredFile(f)
+          promise.resolve(!f.exists())
+        } catch (e: CodedException) {
+          promise.reject(e)
+        } catch (e: Exception) {
+          promise.reject("ERR_CK", "ckRemove failed: ${e.message}", e)
+        }
+      }
+    }
+
+    // b75 round 2 (audit I1): the wrap key itself, once no slot file is left (a full wipe
+    // ends with this; the media slot can outlive the wipe until its files are deleted, and
+    // the key stays while it does). Resolves true when no wrap key is left.
+    // b75 round 3 (DV-11): both wrap keys (the first one and the unlock-bound one made later)
+    AsyncFunction("ckDropWrapIfIdle") { promise: Promise ->
+      synchronized(ckLock) {
+        try {
+          val left = ckDir().listFiles()?.any { it.isFile && it.name.endsWith(".ck") } ?: false
+          val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+          if (!left) {
+            if (ks.containsAlias(CK_WRAP_ALIAS)) ks.deleteEntry(CK_WRAP_ALIAS)
+            if (ks.containsAlias(CK_WRAP_ALIAS_U)) ks.deleteEntry(CK_WRAP_ALIAS_U)
+            try { ckUnlockBoundFlag().delete() } catch (e: Exception) { }
+          }
+          val after = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+          promise.resolve(!after.containsAlias(CK_WRAP_ALIAS) && !after.containsAlias(CK_WRAP_ALIAS_U))
+        } catch (e: Exception) {
+          promise.reject("ERR_CK", "ckDropWrapIfIdle failed: ${e.message}", e)
+        }
+      }
+    }
+
+    // every slot file and the wrap keys themselves (a fresh install's sweep)
+    AsyncFunction("ckRemoveAll") { promise: Promise ->
+      synchronized(ckLock) {
+        try {
+          val dir = ckDir()
+          dir.listFiles()?.forEach { ckShredFile(it) }
+          val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+          for (a in listOf(CK_WRAP_ALIAS, CK_WRAP_ALIAS_U)) if (ks.containsAlias(a)) ks.deleteEntry(a)
+          promise.resolve(true)
+        } catch (e: Exception) {
+          promise.reject("ERR_CK", "ckRemoveAll failed: ${e.message}", e)
+        }
+      }
+    }
+
+    // b75 round 3 (audit DV-11): a phone that had no screen lock when the first wrap key was
+    // made got a key that works while the phone is locked, for good. Asked at each launch
+    // (Vardum in front, the phone unlocked): once the phone has a screen lock, a new wrap
+    // key bound to an unlocked phone is made, every slot file is re-sealed under it (one
+    // file at a time: temp file, fsync, rename; reads pick the key by the file's version
+    // byte, so a launch cut short anywhere leaves every file readable and the next launch
+    // carries on), and only then is the old key deleted. Resolves true when the files are
+    // bound to an unlocked phone; false when it can't be done (yet).
+    AsyncFunction("ckRebindUnlocked") { promise: Promise ->
+      try {
+        promise.resolve(ckRebind())
+      } catch (e: Exception) {
+        promise.reject("ERR_CK", "ckRebindUnlocked failed: ${e.message}", e)
+      }
+    }
+
+    // where the wrap key lives and whether it is bound to an unlocked phone (a diagnostic).
+    // b75 (audit DEV-I6): reads only an existing key; asking never creates one (a wiped
+    // phone used to get a new wrap key just from being asked)
+    Function("ckInfo") {
+      try {
+        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val alias = if (ks.containsAlias(CK_WRAP_ALIAS_U)) CK_WRAP_ALIAS_U else if (ks.containsAlias(CK_WRAP_ALIAS)) CK_WRAP_ALIAS else null
+        val k = if (alias != null) (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey else null
+        if (k == null) mapOf("hardware" to false, "unlockBound" to false)
+        else mapOf("hardware" to keyInsideSecureHardware(k), "unlockBound" to (alias == CK_WRAP_ALIAS_U || ckUnlockBoundFlag().exists()))
+      } catch (e: Exception) {
+        mapOf("hardware" to false, "unlockBound" to false)
+      }
+    }
   }
 
   // ================= internals =================
@@ -353,6 +650,14 @@ class VeilCryptoModule : Module() {
     private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     private const val SE_KEY_ALIAS = "veil-se-wrap-key"
     private const val SE_BLOB_VERSION: Byte = 1
+    private const val LOCK_KEY_ALIAS = "veil-lock-mac-key"
+    /** b75 (AL-6): the Keystore key that seals the container key files */
+    private const val CK_WRAP_ALIAS = "vardum-ck-wrap"
+    private const val CK_VERSION: Byte = 1
+    /** b75 round 3 (audit DV-11): the wrap key made later, once the phone has a screen lock:
+     *  always bound to an unlocked phone; files sealed under it carry version 2 */
+    private const val CK_WRAP_ALIAS_U = "vardum-ck-wrap-u"
+    private const val CK_VERSION_U: Byte = 2
     /** Must match PBKDF2_MIN_ITERATIONS / PBKDF2_MAX_ITERATIONS in vendor/device/src/kdf.ts. */
     private const val PBKDF2_MIN_ITERATIONS = 100_000
     private const val PBKDF2_MAX_ITERATIONS = 1_000_000
@@ -425,6 +730,35 @@ class VeilCryptoModule : Module() {
     }
     generator.init(builder.build())
     generator.generateKey()
+  }
+
+  /** The app-lock HMAC key (VAR-07), created on first use: StrongBox where available. */
+  private fun loadLockMacKey(): javax.crypto.SecretKey {
+    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    if (!ks.containsAlias(LOCK_KEY_ALIAS)) {
+      val builder = KeyGenParameterSpec.Builder(LOCK_KEY_ALIAS, KeyProperties.PURPOSE_SIGN)
+        .setDigests(KeyProperties.DIGEST_SHA256)
+      val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_HMAC_SHA256, ANDROID_KEYSTORE)
+      var made = false
+      if (Build.VERSION.SDK_INT >= 28) {
+        try {
+          builder.setIsStrongBoxBacked(true)
+          generator.init(builder.build())
+          generator.generateKey()
+          made = true
+        } catch (e: StrongBoxUnavailableException) {
+        } catch (e: java.security.ProviderException) {
+        }
+        if (!made) builder.setIsStrongBoxBacked(false)
+      }
+      if (!made) {
+        generator.init(builder.build())
+        generator.generateKey()
+      }
+    }
+    val entry = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.getEntry(LOCK_KEY_ALIAS, null) as? KeyStore.SecretKeyEntry
+      ?: throw CodedException("ERR_LOCK_KEY", "app-lock key unavailable", null)
+    return entry.secretKey
   }
 
   /** The wrap key from the Keystore (created on first use). */
@@ -589,7 +923,195 @@ class VeilCryptoModule : Module() {
     return result ?: throw CodedException("ERR_SE", "se operation failed without a result", null)
   }
 
+
+  // ---------- b75 (AL-6 / AL-11) helpers ----------
+
+  private fun ckContext(): android.content.Context =
+    appContext.reactContext?.applicationContext ?: throw CodedException("ERR_CK", "no context", null)
+
+  private fun ckDir(): java.io.File {
+    val d = java.io.File(ckContext().noBackupFilesDir, "vardum_ck")
+    if (!d.exists() && !d.mkdirs()) throw CodedException("ERR_CK", "container key directory could not be made", null)
+    return d
+  }
+
+  private fun ckFile(slot: String): java.io.File {
+    if (!Regex("^[a-z]$").matches(slot)) throw CodedException("ERR_CK", "bad container key slot", null)
+    return java.io.File(ckDir(), "$slot.ck")
+  }
+
+  private fun ckUnlockBoundFlag(): java.io.File = java.io.File(ckDir(), "wrap.unlock-bound")
+
+  /** b75 round 3 (audit DV-11): one lock for every container-key file operation */
+  private val ckLock = Any()
+
+  /** b75 round 3 (DV-11): the wrap key a file's version byte names, or null (malformed) */
+  private fun ckAliasFor(ver: Byte): String? = when (ver) {
+    CK_VERSION -> CK_WRAP_ALIAS
+    CK_VERSION_U -> CK_WRAP_ALIAS_U
+    else -> null
+  }
+
+  private fun ckSecretKey(ks: KeyStore, alias: String): javax.crypto.SecretKey? =
+    if (ks.containsAlias(alias)) (ks.getEntry(alias, null) as? KeyStore.SecretKeyEntry)?.secretKey else null
+
+  /** b75 round 3 (audit DV-11): see ckRebindUnlocked. True when the slot files are bound to
+   *  an unlocked phone (or there is nothing to bind); false when it can't be done yet. */
+  private fun ckRebind(): Boolean {
+    if (Build.VERSION.SDK_INT < 28) return false
+    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    val hasOld = ks.containsAlias(CK_WRAP_ALIAS)
+    val hasNew = ks.containsAlias(CK_WRAP_ALIAS_U)
+    if (!hasOld) return hasNew // no first key: nothing sealed under it
+    if (!hasNew && ckUnlockBoundFlag().exists()) return true // the first key is already bound
+    val km = ckContext().getSystemService(android.content.Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager ?: return false
+    if (!km.isDeviceSecure || km.isDeviceLocked) return false // no screen lock yet, or locked now
+    // 1. the new key, bound to an unlocked phone (made once; a launch cut short reuses it)
+    if (!hasNew) {
+      try {
+        val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        g.init(
+          KeyGenParameterSpec.Builder(CK_WRAP_ALIAS_U, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setRandomizedEncryptionRequired(true)
+            .setUnlockedDeviceRequired(true)
+            .build()
+        )
+        g.generateKey()
+      } catch (e: Exception) {
+        try { KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.deleteEntry(CK_WRAP_ALIAS_U) } catch (e2: Exception) { }
+        return false
+      }
+    }
+    // 2. every file still sealed under the first key, re-sealed under the new one
+    val dir = ckDir()
+    val names = dir.listFiles()?.filter { it.isFile && it.name.endsWith(".ck") }?.map { it.name } ?: emptyList()
+    for (name in names) {
+      synchronized(ckLock) {
+        val f = java.io.File(dir, name)
+        val slot = name.removeSuffix(".ck")
+        if (!f.exists() || !Regex("^[a-z]$").matches(slot)) return@synchronized
+        val bytes = f.readBytes()
+        if (bytes.size != 1 + 4 + 12 + 32 + 16 || bytes[0] != CK_VERSION) return@synchronized
+        val ks2 = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        val oldKey = ckSecretKey(ks2, CK_WRAP_ALIAS) ?: return false
+        val newKey = ckSecretKey(ks2, CK_WRAP_ALIAS_U) ?: return false
+        val gen = java.nio.ByteBuffer.wrap(bytes, 1, 4).int
+        val aad = "vardum-ck|$slot|$gen".toByteArray(Charsets.UTF_8)
+        val dec = Cipher.getInstance("AES/GCM/NoPadding")
+        dec.init(Cipher.DECRYPT_MODE, oldKey, GCMParameterSpec(128, bytes.copyOfRange(5, 17)))
+        dec.updateAAD(aad)
+        val raw = dec.doFinal(bytes.copyOfRange(17, bytes.size))
+        try {
+          val enc = Cipher.getInstance("AES/GCM/NoPadding")
+          enc.init(Cipher.ENCRYPT_MODE, newKey)
+          enc.updateAAD(aad)
+          val ct = enc.doFinal(raw)
+          val iv = enc.iv
+          if (iv.size != 12 || ct.size != 48) return false
+          val out = java.nio.ByteBuffer.allocate(1 + 4 + 12 + 48).put(CK_VERSION_U).putInt(gen).put(iv).put(ct).array()
+          val tmp = java.io.File(dir, "$name.tmp")
+          java.io.FileOutputStream(tmp).use { os -> os.write(out); os.flush(); os.fd.sync() }
+          if (!tmp.renameTo(f)) { tmp.delete(); return false }
+          ckSyncDir(dir)
+        } finally {
+          raw.fill(0)
+        }
+      }
+    }
+    // 3. nothing left under the first key: it goes, and the flag records the binding
+    synchronized(ckLock) {
+      val stillOld = dir.listFiles()?.any { it.isFile && it.name.endsWith(".ck") && it.length() == 65L && it.readBytes()[0] == CK_VERSION } ?: false
+      if (stillOld) return false // a file made meanwhile: the next launch moves it
+      KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.deleteEntry(CK_WRAP_ALIAS)
+      java.io.FileOutputStream(ckUnlockBoundFlag()).use { it.write(1); it.fd.sync() }
+    }
+    return true
+  }
+
+  /** overwrite with zeros, sync, delete. b75 round 2 (audit I2): the delete (the key is
+   *  gone) is the protection; the zero overwrite is best-effort, since flash storage may
+   *  keep the old blocks. */
+  private fun ckShredFile(f: java.io.File) {
+    if (!f.exists()) return
+    try {
+      val n = f.length().toInt().coerceAtLeast(0)
+      java.io.RandomAccessFile(f, "rw").use { raf -> raf.seek(0); raf.write(ByteArray(n)); raf.fd.sync() }
+    } catch (e: Exception) { /* the delete below still runs */ }
+    if (!f.delete() && f.exists()) throw CodedException("ERR_CK", "container key file could not be deleted", null)
+    f.parentFile?.let { ckSyncDir(it) }
+  }
+
+  private fun ckSyncDir(dir: java.io.File) {
+    try {
+      val fd = android.system.Os.open(dir.absolutePath, android.system.OsConstants.O_RDONLY, 0)
+      try { android.system.Os.fsync(fd) } finally { android.system.Os.close(fd) }
+    } catch (e: Exception) { /* not every filesystem allows a directory fsync */ }
+  }
+
+  /** The Keystore key that seals the container key files: AES-256-GCM, TEE (never
+   *  StrongBox: speed), no user auth (background receive), bound to an unlocked phone
+   *  where the platform allows it. */
+  private fun ckWrapKey(): javax.crypto.SecretKey {
+    val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+    if (!ks.containsAlias(CK_WRAP_ALIAS)) {
+      val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+      fun spec(unlocked: Boolean): KeyGenParameterSpec {
+        val b = KeyGenParameterSpec.Builder(CK_WRAP_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+          .setKeySize(256)
+          .setRandomizedEncryptionRequired(true)
+        if (unlocked && Build.VERSION.SDK_INT >= 28) b.setUnlockedDeviceRequired(true)
+        return b.build()
+      }
+      var bound = false
+      if (Build.VERSION.SDK_INT >= 28) {
+        try {
+          generator.init(spec(true))
+          generator.generateKey()
+          bound = true
+        } catch (e: Exception) {
+          try { ks.deleteEntry(CK_WRAP_ALIAS) } catch (e2: Exception) { }
+        }
+      }
+      if (!bound) {
+        generator.init(spec(false))
+        generator.generateKey()
+      }
+      val flag = ckUnlockBoundFlag()
+      if (bound) { java.io.FileOutputStream(flag).use { it.write(1); it.fd.sync() } } else if (flag.exists()) flag.delete()
+    }
+    val entry = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }.getEntry(CK_WRAP_ALIAS, null) as? KeyStore.SecretKeyEntry
+      ?: throw CodedException("ERR_CK_UNAVAILABLE", "container wrap key unavailable", null)
+    return entry.secretKey
+  }
+
+  /** b75 (audit AL-11): the key's real security level, from its KeyInfo */
+  private fun keyInsideSecureHardware(key: javax.crypto.SecretKey): Boolean {
+    val factory = javax.crypto.SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
+    val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
+    return if (Build.VERSION.SDK_INT >= 31) {
+      info.securityLevel == KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT ||
+        info.securityLevel == KeyProperties.SECURITY_LEVEL_STRONGBOX ||
+        info.securityLevel == KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE
+    } else {
+      @Suppress("DEPRECATION")
+      info.isInsideSecureHardware
+    }
+  }
+
   // ---------- hex / base64 helpers (mirror the Swift helpers) ----------
+
+  /** b77t (audit 5 L-31, IH DEV-8): hex that must be well-formed (the AES-GCM AAD). hexToBytes returns an empty
+   *  array for malformed hex, which for the AAD meant "no AAD" (fail open); this throws instead. "" = no AAD. */
+  private fun strictHexToBytes(hex: String): ByteArray {
+    val out = hexToBytes(hex)
+    if (out.size * 2 != hex.length) throw CodedException("ERR_BAD_INPUT", "malformed hex (AAD)", null)
+    return out
+  }
 
   private fun hexToBytes(hex: String): ByteArray {
     val chars = hex.toCharArray()

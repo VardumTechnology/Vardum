@@ -12,7 +12,7 @@
           "remote-notification"
         ],
         "NSFaceIDUsageDescription": "Vardum uses Face ID to unlock your encrypted messages on this device. Your biometrics never leave the device.",
-        "NSMicrophoneUsageDescription": "Vardum uses the microphone only during end-to-end encrypted calls. Audio never leaves your device unencrypted.",
+        "NSMicrophoneUsageDescription": "Vardum uses the microphone only when you record a voice note or are on a call. Voice notes are encrypted on this phone before they are sent, and call audio is encrypted between the two phones.",
         "ITSAppUsesNonExemptEncryption": false
       },
       "bundleIdentifier": "au.com.mattthemagicalmentalist.veil",
@@ -27,12 +27,16 @@
         ]
       },
       "associatedDomains": [
-        "applinks:tryveil.app"
-      ]
+        "applinks:tryveil.app",
+        "applinks:tryvardum.app"
+      ],
+      "entitlements": {
+        "com.apple.developer.default-data-protection": "NSFileProtectionComplete"
+      }
     },
     "android": {
       "package": "app.tryvardum.android",
-      "versionCode": 69,
+      "versionCode": 77,
       "allowBackup": false,
       "softwareKeyboardLayoutMode": "pan",
       "adaptiveIcon": {
@@ -67,6 +71,11 @@
               "scheme": "https",
               "host": "tryveil.app",
               "path": "/"
+            },
+            {
+              "scheme": "https",
+              "host": "tryvardum.app",
+              "path": "/"
             }
           ],
           "category": [
@@ -80,19 +89,20 @@
       [
         "expo-image-picker",
         {
-          "photosPermission": "Vardum uses the photo library only to attach images you choose to your encrypted messages. Photos never leave the device unencrypted."
+          "photosPermission": "Vardum asks for full Photos access only when you save an image to Photos (from a chat or from Stego), so that when you wipe Vardum it can delete the images it saved (iOS asks first). It doesn't read or upload your other photos. Attaching a photo to a message uses the system picker, which shows Vardum only the photos you pick."
         }
       ],
       [
         "expo-av",
         {
-          "microphonePermission": "Vardum uses the microphone only when you tap the mic to record a voice note. The recording is encrypted on this device before it is sent."
+          "microphonePermission": "Vardum uses the microphone only when you record a voice note or are on a call. Voice notes are encrypted on this phone before they are sent, and call audio is encrypted between the two phones."
         }
       ],
       [
         "expo-media-library",
         {
-          "savePhotosPermission": "Vardum saves an image to Photos only when you tap Save to Photos on it. Nothing is saved automatically.",
+          "savePhotosPermission": "Vardum saves an image to Photos only when you tap Save to Photos on it, and deletes the images it saved when you wipe Vardum (iOS asks first). Nothing is saved automatically.",
+          "photosPermission": "Vardum asks for full Photos access only when you save an image to Photos (from a chat or from Stego), so that when you wipe Vardum it can delete the images it saved (iOS asks first). It doesn't read or upload your other photos. Attaching a photo to a message uses the system picker, which shows Vardum only the photos you pick.",
           "isAccessMediaLocationEnabled": false
         }
       ],
@@ -101,7 +111,8 @@
         {
           "mode": "production",
           "icon": "./assets/android/notification-icon.png",
-          "color": "#20D9C2"
+          "color": "#20D9C2",
+          "sounds": ["./assets/veil_ring.wav"]
         }
       ],
       [
@@ -113,6 +124,8 @@
         }
       ],
       "./plugins/with-kotlin-plugin-version",
+      "./plugins/with-no-data-extraction",
+      "./plugins/with-reproducible-build",
       [
         "expo-build-properties",
         {
@@ -136,7 +149,6 @@
       "eas": {
         "projectId": "e0298236-a0f0-4a29-b486-f14cc8577545"
       }
-    },
-    "scheme": "veil"
+    }
   }
 }

@@ -8,33 +8,37 @@
  *   token = xu(24)  (hex of 24 random bytes)
  *   myWrite = xu(32) (hex) — stored on-device as the ratchet state's writeSecret
  *   peerWrite = xu(32) — travels ONLY in the link fragment #w=
- *   createSession(token, '') → pending initiator ratchet (X25519 + ML-KEM pub)
+ *   linkSecret k = xu(32) — mixed into the session root; travels only in the fragment
+ *   createSession(token, k, dials) → pending initiator ratchet (X25519 + ML-KEM pub)
  *   VeilSession.create {token, state:'pending', initiator_client_id, ...,
  *     initiator_pub_jwk, initiator_pq_pub, initiator_write_hash=sha256hex(myWrite),
  *     responder_write_hash=sha256hex(peerWrite), expires 24h,
  *     default_ttl_seconds, key_retention_hours, burn_after_open (BOOL, dial>0),
  *     expire_after_seconds}
- *   link = {origin}/?join={token}#w={encodeURIComponent(peerWrite)}
+ *   link = {origin}/?join={token}#w={encodeURIComponent(peerWrite)}&k={linkSecret}&d={dials}
  *   — the initiator's existing pending loop (App advanceHandshake) completes
  *     the handshake when the responder joins: state active + responder fields.
  *
  * RESPONDER ("Join with an invite link")
- *   parse → { token, #w= }
+ *   parse → { token, #w=, &k=, &d= } (a link without k is refused as from an older version)
  *   peek {action:'peek', token, write_secret:w} → session record
  *   validations: ended / active-and-not-mine / expired / missing initiator key
- *   joinSession(token, '', initiator_pub_jwk, initiator_pq_pub) → READY state
+ *   joinSession(token, k, initiator_pub_jwk, initiator_pq_pub, dials) → READY state
  *     + responder fields + fingerprint (writeSecret = w, the #w fragment)
- *   join {action:'join', token, write_secret:w, client_id, display_name,
+ *   join {action:'join', token, write_secret:w, client_id,
  *     responder_pub_jwk, responder_ratchet_pub_jwk, responder_pq_ct, fingerprint}
  *   clobber check: record's responder fields must echo ours (VEIL-JOIN-CLOBBERED)
  */
+import { pinDeps } from './wipe-generation';
 import {
   randomBytes, utf8,
   createSession, joinSession, serializeRatchetState, clampDials, canonicalDials,
+  deliveryForRole,
 } from '../../crypto-core/src/index';
+import { scheduleInboundOpen, prepareOpenBlind, adoptJoinOpenSig, isOpenKeyRefusal, noteOpenKeyRefused } from './sealed';
 import type { DialsInput } from '../../crypto-core/src/ratchet';
 import { sha256 } from '../../crypto-core/src/kdf';
-import type { SessionStore } from './session-store';
+import { isChatToken, type SessionStore } from './session-store'; // b77m (audit VAR-26): isChatToken
 import { saveOrThrow } from './save-strict';
 import type { VeilRelay } from './relay';
 
@@ -81,12 +85,13 @@ export async function createInviteSession(
           /** group mode: bind the session to a group + encrypted name blob.
            *  activate=true creates the creator's MAIN group session (immediately
            *  active, no responder ever joins it) — web parity. */
-          group?: { groupToken: string; groupNameBlob: string; activate?: boolean; epoch?: number; pqPubB64?: string; stampEpoch?: boolean;
+          group?: { groupToken: string; groupNameBlob: string; activate?: boolean; epoch?: number; pqPubB64?: string;
                     /** b199: lock this seat to one person — the relay only lets
                      *  the account that owns this Veil ID peek or join it, so a
                      *  forwarded invite is useless to anyone else. */
                     inviteeVeilId?: string } },
 ): Promise<CreatedInvite> {
+  deps = pinDeps(deps); // b70 (re-review 9): a wipe while this waits on the relay stops its writes
   const token = hexRand(24);
   const myWrite = hexRand(32);
   const peerWrite = hexRand(32);
@@ -100,15 +105,12 @@ export async function createInviteSession(
   const dials = clampDials(opts.dials);
   const { state, initiatorPub, initiatorPqPub } = await createSession(token, linkSecret, dials);
   state.writeSecret = myWrite;
-  // b188-r5 (owner repro: forum joined fine, then "No posting session for
-  // this forum on this device" on first send): KeychainStorage.set swallows
-  // write errors and returns false, and the old code IGNORED that — a silent
-  // keychain failure left a record pointing at a session that never persisted.
-  // Fail the join HONESTLY instead of leaving a dangling posting session.
+  // b188-r5: KeychainStorage.set swallows write errors and returns false, and
+  // the old code IGNORED that — a silent keychain failure left a record
+  // pointing at a session that never persisted. Fail HONESTLY instead.
   // b193: the CREATE path must persist the dials too — the join path always
   // has (7200/86400 fallbacks there); without them every send off a
-  // created session falls back to ttl 86400, which is why forum posts were
-  // +24h envelopes even after the relay honored 30-day sessions.
+  // created session falls back to ttl 86400.
   const saved = await deps.sessions.save(token, {
     ...(await serializeRatchetState(state)),
     burnAfterOpen: dials.burnAfterOpen,
@@ -120,10 +122,10 @@ export async function createInviteSession(
   await deps.relay.entityCreate('VeilSession', {
     token,
     state: 'pending',
-    initiator_client_id: opts.clientId,
+    // b77 (sealed sender): a 1:1 row carries no account id (the relay never stored the body's copy)
+    ...(opts.group ? { initiator_client_id: opts.clientId } : {}),
     responder_client_id: '',
-    initiator_display_name: opts.displayName ?? '',
-    responder_display_name: '',
+    // b71 (review R-1): no display names on the row (the relay drops them; opts.displayName is unused)
     passphrase_required: false,
     session_fingerprint: '',
     initiator_pub_jwk: initiatorPub,
@@ -134,8 +136,7 @@ export async function createInviteSession(
     responder_verified: false,
     // b192: session lifetime comes from the DIALS, not a hard-coded 24h — the
     // relay stores the declared expiry (hard 30-day ceiling). Regular invites
-    // dial expireAfterSeconds 86400 so behavior is unchanged there; forum
-    // posting sessions dial 2592000 and now actually get their 30 days.
+    // dial expireAfterSeconds 86400 so behavior is unchanged there.
     expires_at: new Date(Date.now() + (dials.expireAfterSeconds || 86400) * 1000).toISOString(),
     default_ttl_seconds: dials.defaultTtlSeconds,
     key_retention_hours: dials.keyRetentionHours,
@@ -148,14 +149,8 @@ export async function createInviteSession(
       ? {
           group_token: opts.group.groupToken,
           group_name: opts.group.groupNameBlob,
-          // b188-r8 (owner repro: "Epoch does not match the group epoch"):
-          // FORUM POSTING sessions must carry their group's epoch — the relay
-          // gate compares the envelope header's ge against this row. Creator /
-          // member join rows must NOT pre-stamp it: the gate's rotate action
-          // requires new_epoch == current + 1, and pre-stamping the main row
-          // makes the group-creation rotate fail with HTTP 400. Hence the
-          // explicit stampEpoch flag (only the forum join path sets it).
-          ...(opts.group.stampEpoch ? { group_epoch: opts.group.epoch ?? 0 } : {}),
+          // (creator / member rows never pre-stamp group_epoch: the gate's rotate
+          // action requires new_epoch == current + 1)
           ...(opts.group.inviteeVeilId ? { invitee_veil_id: opts.group.inviteeVeilId } : {}),
         }
       : {}),
@@ -176,7 +171,11 @@ export async function createInviteSession(
 /** Parse an invite link (web URL or pasted text). b54 links carry
  *  #w=<write secret>&k=<link secret>; group invites additionally carry
  *  &g=<group GEK b64>&e=<epoch>&c=<creator IK b64>; from b56 (Batch D, D-03)
- *  also &t=<group token>&ph=<groupLinkBinding hex>. */
+ *  also &t=<group token>&ph=<groupLinkBinding hex>.
+ *  b71 (review P-01 / P-02): from b71 g= is only the marker "v2", never a key (the
+ *  key comes from the creator after admission; an older link's g= key is parsed but
+ *  never used), and s=<32 hex salt>:
+ *  the group token must equal groupIdFor(c, s). */
 /** Batch F (R4-1-01): the dials as they travel in a link: ttl.expire.retention.burn */
 export function linkDials(d: Partial<DialsInput>): string {
   const c = clampDials(d);
@@ -188,20 +187,27 @@ export function linkDials(d: Partial<DialsInput>): string {
  *  locally faster than this, so the relay can only lengthen its burn window. */
 export const PEEK_DIALS_BURN_FLOOR_SECONDS = 86400;
 
-export function parseInviteLink(link: string): { token: string; writeSecret: string; linkSecret?: string; creatorIk?: string; gek?: string; epoch?: number; groupToken?: string; groupBind?: string; dials?: DialsInput } {
+export function parseInviteLink(link: string): { token: string; writeSecret: string; linkSecret?: string; creatorIk?: string; gek?: string; epoch?: number; groupToken?: string; groupBind?: string; groupBind2?: string; groupSalt?: string; dials?: DialsInput } {
   const t = link.match(/[?&]join=([^&#\s]+)/i);
   const w = link.match(/[#&?]w=([^&#\s]+)/i);
   // b54: k = invite link secret (64 hex, fragment only); c = group creator IK
   const k = link.match(/[#&]k=([0-9a-f]{64})(?=[&#\s]|$)/i);
   const c = link.match(/[#&]c=([^&#\s]+)/i);
   if (!t || !w) throw new Error('That is not a Vardum invite link — ask your peer for a fresh one.');
+  // b77m (audit VAR-26): the token becomes this chat's storage keys (and a seat's relay id) — 48 lowercase hex
+  // only; a link with `<another chat's token>_p0` used to read and then retire that chat's history
+  let tokenIn = '';
+  try { tokenIn = decodeURIComponent(t[1]); } catch { tokenIn = ''; }
+  if (!isChatToken(tokenIn)) throw new Error('That is not a Vardum invite link — ask your peer for a fresh one.');
   const g = link.match(/[?&]g=([^&#\s]+)/i);
   const e = link.match(/[?&]e=(\d+)/i);
   const gt = link.match(/[#&]t=([0-9a-f]{16,64})(?=[&#\s]|$)/i);
   const ph = link.match(/[#&]ph=([0-9a-f]{64})(?=[&#\s]|$)/i);
+  const ph2 = link.match(/[#&]ph2=([0-9a-f]{64})(?=[&#\s]|$)/i); // b70 (VAR-10)
+  const gs = link.match(/[#&]s=([0-9a-f]{32})(?=[&#\s]|$)/i); // b71 (review P-02)
   const d = link.match(/[#&]d=(\d+)\.(\d+)\.(\d+)\.([01])(?=[&#\s]|$)/);
   return {
-    token: decodeURIComponent(t[1]),
+    token: tokenIn,
     writeSecret: decodeURIComponent(w[1]),
     linkSecret: k ? k[1].toLowerCase() : undefined,
     creatorIk: c ? decodeURIComponent(c[1]) : undefined,
@@ -209,8 +215,22 @@ export function parseInviteLink(link: string): { token: string; writeSecret: str
     epoch: e ? Number(e[1]) : undefined,
     groupToken: gt ? gt[1].toLowerCase() : undefined,
     groupBind: ph ? ph[1].toLowerCase() : undefined,
+    groupBind2: ph2 ? ph2[1].toLowerCase() : undefined,
+    groupSalt: gs ? gs[1].toLowerCase() : undefined,
     dials: d ? clampDials({ defaultTtlSeconds: Number(d[1]), expireAfterSeconds: Number(d[2]), keyRetentionHours: Number(d[3]), burnAfterOpen: d[4] === '1' }) : undefined,
   };
+}
+
+/** b77q (audit 3 DV-3): what an invite link is, by the documented marker alone: `g=` = a group seat, anything else
+ *  1:1. A link that carries group-only fields (t, c, s, ph, ph2, e) without `g=` is neither — it throws, so the
+ *  app's router and joinInviteSession can't disagree about it (the app should route with this too). */
+export function inviteLinkKind(link: string | ReturnType<typeof parseInviteLink>): '1:1' | 'group' {
+  const p = typeof link === 'string' ? parseInviteLink(link) : link;
+  if (p.gek) return 'group';
+  if (p.groupToken || p.creatorIk || p.groupSalt || p.groupBind || p.groupBind2 || p.epoch !== undefined) {
+    throw new Error('This invite link is damaged (it mixes a chat link with group details), so it was not opened. Ask for a fresh link.');
+  }
+  return '1:1';
 }
 
 /** Responder: join a session from an invite link. READY on return. */
@@ -218,8 +238,13 @@ export async function joinInviteSession(
   deps: InviteDeps,
   opts: { link: string; clientId: string; displayName?: string },
 ): Promise<JoinedInvite> {
-  const { token, writeSecret, linkSecret, dials: linkDialsIn } = parseInviteLink(opts.link);
+  deps = pinDeps(deps); // b70 (re-review 9): a wipe while this waits on the relay stops its writes
+  const parsedLink = parseInviteLink(opts.link);
+  const { token, writeSecret, linkSecret, dials: linkDialsIn } = parsedLink;
   if (!linkSecret) throw new Error('This invite link is from an older version of Vardum. Ask for a fresh link.');
+  // b77q (audit 3 DV-3): group or 1:1 by the documented marker (g=) alone, the app's rule too; a link carrying group
+  // fields without it is refused before anything is sent (inviteLinkKind throws)
+  const linkKind = inviteLinkKind(parsedLink);
 
   const existing = await deps.sessions.load(token);
   if (existing?.ready && existing.fingerprint) {
@@ -232,9 +257,20 @@ export async function joinInviteSession(
   if (existing?.ready) {
     console.log('[veil-invite] dropping half-joined ghost state for ' + token.slice(0, 4));
     await deps.sessions.remove(token);
+  } else if (existing) {
+    // b75 (audit RT-4): any other local state for this token — above all the creator's own
+    // pending initiator state, when someone sends you your own link back — is never
+    // overwritten by a join (that lost the handshake keys and locked the real invitee out)
+    throw new Error('This invitation was made on this phone, so it can\'t be joined here. Send the link to the person you want to chat with.');
   }
 
-  const pk = await deps.relay.sessionPeek(token, writeSecret);
+  // b77 (sealed sender): a 1:1 link is peeked without login (the write secret is the proof)
+  // b77q (audit 3 DV-3): it was gek OR groupToken, so a 1:1 link with `&t=<hex>` appended (the app routes it here:
+  // no g=) peeked and joined on the logged-in routes with this phone's account client id next to the rendezvous
+  const linkIsGroup = linkKind === 'group';
+  const pk = !linkIsGroup && typeof (deps.relay as Partial<VeilRelay>).sessionPeekAnon === 'function'
+    ? await deps.relay.sessionPeekAnon(token, writeSecret)
+    : await deps.relay.sessionPeek(token, writeSecret);
   const pd = pk.data as { data?: { session?: Record<string, string> }; session?: Record<string, string> };
   const rec = pd?.data?.session ?? pd?.session ?? (pk.data as Record<string, string>);
   if (!rec) throw new Error('Invitation not found or expired.');
@@ -247,6 +283,12 @@ export async function joinInviteSession(
   }
   if (!rec.initiator_pub_jwk) {
     throw new Error('This session was created by an older client and cannot be joined.');
+  }
+  // b77r1 (audit A-3): group or 1:1 is decided by the LINK alone. A 1:1 link whose peek answer
+  // claims a group (group_token) is refused: a relay must not turn an anonymous 1:1 join into a
+  // logged-in one carrying this phone's account id (and no mailbox tickets)
+  if (!linkIsGroup && (rec as { group_token?: unknown }).group_token) {
+    throw new Error('This invitation does not match what the server sent, so it was not opened. Ask for a fresh link.');
   }
 
   // Batch C (V-12): the row's dials, clamped, are bound into the fingerprint —
@@ -267,8 +309,15 @@ export async function joinInviteSession(
   }
   const dials = linkDialsIn ?? peekDials;
   const dialsSource: 'link' | 'peek' = linkDialsIn ? 'link' : 'peek';
-  const { state, responderPub, responderRatchetPub, responderPqCt, fingerprint } =
+  const { state, responderPub, responderRatchetPub, responderPqCt, fingerprint, delivery: caps } =
     await joinSession(token, linkSecret, rec.initiator_pub_jwk, rec.initiator_pq_pub || null, dials);
+  // b77 (sealed sender): a 1:1 invite chat gets delivery capabilities (from rk0); a group seat
+  // stays on the group protocol (its session ratchet only carries the relay credential)
+  const isGroupSeat = linkIsGroup; // b77r1 (audit A-3): never from the relay's answer
+  const delivery = isGroupSeat ? null : await deliveryForRole(caps, 'responder');
+  // b77p (audit 2 VAR-01): my blinded mailbox-open token rides the join (it replaced the two ticket hashes the
+  // relay could match to the later opens)
+  const openPrep = isGroupSeat ? null : await prepareOpenBlind(deps.relay, deps.sessions); // b77q (audit 3 CR-1): the pinned issuer key
   // Batch C (V-16, client half): retire the link's w at join — a fresh
   // responder credential replaces it, so anyone else holding the link can no
   // longer act as this member. Kept only if the relay confirms the new hash.
@@ -276,16 +325,22 @@ export async function joinInviteSession(
   const freshHash = await writeHashHex(freshWrite);
   state.writeSecret = writeSecret;
 
+  // b77 (sealed sender): a 1:1 join is anonymous (no login, no client id) and carries my blinded
+  // open token (b77p); a group seat joins as before
   const j = await deps.relay.sessionJoin({
     token,
     write_secret: writeSecret,
-    client_id: opts.clientId,
-    display_name: opts.displayName ?? '',
+    client_id: isGroupSeat ? opts.clientId : '', // b71 (review R-1): no display_name (opts.displayName is unused)
     responder_pub_jwk: responderPub,
     responder_ratchet_pub_jwk: responderRatchetPub,
     responder_pq_ct: responderPqCt,
     fingerprint,
     new_responder_write_hash: freshHash,
+    ...(openPrep ? { open_blind: openPrep.open_blind, open_kid: openPrep.open_kid } : {}),
+  }, { anon: !isGroupSeat }).catch(async (e) => {
+    // b77q (audit 3 CR-1): the relay refused the issuer key: noted on the pin (a retried join may fetch again)
+    if (openPrep && isOpenKeyRefusal(e)) await noteOpenKeyRefused(deps.sessions, openPrep.open_kid).catch(() => undefined);
+    throw e;
   });
   const jd = j.data as { data?: { session?: Record<string, string> }; session?: Record<string, string> };
   const joined = jd?.data?.session ?? jd?.session;
@@ -307,16 +362,35 @@ export async function joinInviteSession(
     defaultTtlSeconds: dials.defaultTtlSeconds,
     expireAfterSeconds: dials.expireAfterSeconds,
     dialsSource, // Batch F (R4-1-01)
+    ...(delivery ? { delivery } : {}), // b77 (sealed sender)
   } as never);
+  // b77: open my own inbound after the random 5–120 s delay
+  if (delivery) await scheduleInboundOpen(deps.sessions, token);
+  // b77p: keep the unblinded open token (or the blind, so gate `issue` can recover a lost signature)
+  if (delivery && openPrep) await adoptJoinOpenSig(deps.relay, deps.sessions, token, openPrep.blind, j);
 
   return { token, fingerprint, alreadyJoined: false };
 }
 
 
-/** Group invite links append the GEK + epoch fragments (web parity:
- *  ?join=<token>#w=<secret>&g=<gek>&e=<epoch>). */
-export function groupInviteLink(baseLink: string, gekB64: string, epoch: number, creatorIkB64: string, groupToken: string, groupBindHex: string): string {
-  return `${baseLink}&g=${encodeURIComponent(gekB64)}&e=${epoch}&c=${encodeURIComponent(creatorIkB64)}&t=${groupToken}&ph=${groupBindHex}`;
+/** Group invite links append the group fragments to the invite link:
+ *  ?join=<token>#w=…&k=…&d=…&g=v2&e=<epoch>&c=<creator IK>&t=<group token>&s=<salt>&ph=…&ph2=…
+ *  b71 (review P-01): NO group key — links used to carry &g=<GEK>, so anyone holding
+ *  one (admitted or not) could read every message of the epoch. The joiner gets the
+ *  key from the creator after its seat proof checks out. g= stays as a marker
+ *  ("v2", never a key): the app and the chat-invite card tell group links by it, and
+ *  without it an older build would open the seat as a 1:1 chat.
+ *  b71 (review P-02): s= is the salt the group token commits to with the creator key. */
+export const GROUP_LINK_MARK = 'v2';
+export function groupInviteLink(baseLink: string, epoch: number, creatorIkB64: string, groupToken: string, groupSaltHex: string, groupBindHex: string, groupBind2Hex?: string): string {
+  // b70 (audit VAR-10): ph2 also binds the creator key; ph stays for older joiners
+  return `${baseLink}&g=${GROUP_LINK_MARK}&e=${epoch}&c=${encodeURIComponent(creatorIkB64)}&t=${groupToken}&s=${groupSaltHex}&ph=${groupBindHex}${groupBind2Hex ? `&ph2=${groupBind2Hex}` : ''}`;
+}
+
+/** b70 (audit VAR-10 / GRP-1): binds a group link to its group AND its creator key */
+export async function groupLinkBinding2(groupToken: string, groupPqPubB64: string, creatorIkB64: string): Promise<string> {
+  const h = await sha256(utf8(`vardum-group-link-v2:${groupToken}:${groupPqPubB64}:${creatorIkB64}`));
+  return Array.from(h).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /** Batch D (D-03, RV-03): binds a group link to its group. The relay supplies the

@@ -9,7 +9,7 @@
  *   decoder — including the web canvas, so native-embedded images extract
  *   on the web and vice versa (the LSB payload is byte-identical).
  */
-import { inflate as pakoInflate, deflate as pakoDeflate } from 'pako';
+import { Inflate as PakoInflate, deflate as pakoDeflate } from 'pako';
 
 export interface PngImage {
   width: number;
@@ -19,6 +19,47 @@ export interface PngImage {
 }
 
 const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/** b77m (audit VAR-31): the largest image decodePng accepts, in pixels (40 MP: a 50 MP phone photo must be
+ *  scaled down first). The RGBA output is 4 bytes a pixel, so this bounds that buffer at 160 MB. */
+export const PNG_MAX_PIXELS = 40_000_000;
+/** b77m (audit VAR-31): the longest side accepted */
+export const PNG_MAX_SIDE = 20_000;
+/** b77m (audit VAR-31): the most compressed image data (all IDAT chunks) read */
+export const PNG_MAX_IDAT_BYTES = 256 * 1024 * 1024;
+
+export interface PngDecodeLimits { maxPixels?: number; maxSide?: number }
+
+/** b77m (audit VAR-31): inflate at most `expected` bytes, and exactly that many — the zlib stream is
+ *  decompressed in chunks and stopped as soon as it would pass `expected` (no unbounded output buffer:
+ *  a 261 KB file used to inflate 256 MiB before anything was checked). */
+function inflateExact(data: Uint8Array, expected: number): Uint8Array {
+  const out = new Uint8Array(expected);
+  let got = 0;
+  let over = false;
+  const inf = new PakoInflate({ chunkSize: 65536 });
+  const STOP = new Error('png: inflate stopped');
+  inf.onData = (chunk: Uint8Array) => {
+    if (got + chunk.length > expected) { over = true; throw STOP; } // stops the inflate loop at once
+    out.set(chunk, got);
+    got += chunk.length;
+  };
+  // push in slices so an over-long stream is noticed (and abandoned) early
+  const SLICE = 65536;
+  for (let i = 0; i < data.length && !over; i += SLICE) {
+    try {
+      inf.push(data.subarray(i, Math.min(data.length, i + SLICE)), i + SLICE >= data.length);
+    } catch (e) {
+      if (e !== STOP) throw new Error('Corrupted PNG: bad image data');
+      break;
+    }
+    if (inf.err) throw new Error('Corrupted PNG: bad image data');
+  }
+  if (!data.length) throw new Error('Corrupted PNG: no image data');
+  if (over) throw new Error('Corrupted PNG: image data is larger than the image');
+  if (got !== expected) throw new Error('Corrupted PNG: image data is shorter than the image');
+  return out;
+}
 
 let CRC_TABLE: Uint32Array | null = null;
 function crcTable(): Uint32Array {
@@ -84,7 +125,10 @@ function unfilter(raw: Uint8Array, bpp: number, row: Uint8Array, prev: Uint8Arra
   }
 }
 
-export function decodePng(bytes: Uint8Array): PngImage {
+export function decodePng(bytes: Uint8Array, limits: PngDecodeLimits = {}): PngImage {
+  const maxPixels = Math.min(limits.maxPixels ?? PNG_MAX_PIXELS, PNG_MAX_PIXELS);
+  const maxSide = Math.min(limits.maxSide ?? PNG_MAX_SIDE, PNG_MAX_SIDE);
+  if (!(bytes instanceof Uint8Array) || bytes.length < 8) throw new Error('Not a PNG file');
   for (let i = 0; i < 8; i++) {
     if (bytes[i] !== PNG_SIG[i]) throw new Error('Not a PNG file');
   }
@@ -97,11 +141,17 @@ export function decodePng(bytes: Uint8Array): PngImage {
   let palette: Uint8Array | null = null;
   let trns: Uint8Array | null = null;
   const idat: Uint8Array[] = [];
+  let idatLen = 0;
+  let sawIhdr = false;
   while (pos + 8 <= bytes.length) {
     const len = readU32(bytes, pos);
     const type = String.fromCharCode(bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]);
+    // b77m (audit VAR-31): a chunk must fit inside the file
+    if (len > bytes.length - pos - 8) throw new Error('Corrupted PNG: truncated chunk');
     const data = bytes.subarray(pos + 8, pos + 8 + len);
     if (type === 'IHDR') {
+      if (sawIhdr || len !== 13) throw new Error('Corrupted PNG: bad IHDR');
+      sawIhdr = true;
       width = readU32(data, 0);
       height = readU32(data, 4);
       bitDepth = data[8];
@@ -112,6 +162,8 @@ export function decodePng(bytes: Uint8Array): PngImage {
     } else if (type === 'tRNS') {
       trns = data;
     } else if (type === 'IDAT') {
+      idatLen += data.length;
+      if (idatLen > PNG_MAX_IDAT_BYTES) throw new Error('Unsupported PNG: the image is too large');
       idat.push(data);
     } else if (type === 'IEND') {
       break;
@@ -119,6 +171,8 @@ export function decodePng(bytes: Uint8Array): PngImage {
     pos += 12 + len;
   }
   if (!width || !height) throw new Error('Corrupted PNG: no IHDR');
+  // b77m (audit VAR-31): the size is checked BEFORE anything is allocated or inflated
+  if (width > maxSide || height > maxSide || width * height > maxPixels) throw new Error('Unsupported PNG: the image is too large');
   if (bitDepth !== 8) throw new Error('Unsupported PNG: only 8-bit images are supported');
   if (interlace) throw new Error('Unsupported PNG: interlaced images are not supported');
 
@@ -132,16 +186,17 @@ export function decodePng(bytes: Uint8Array): PngImage {
     default: throw new Error('Unsupported PNG colour type');
   }
 
-  const idatLen = idat.reduce((n, c) => n + c.length, 0);
+  if (colorType === 3 && (!palette || palette.length < 3 || palette.length % 3 !== 0)) throw new Error('Corrupted PNG: missing palette');
   const idatBytes = new Uint8Array(idatLen);
   let off = 0;
   for (const c of idat) {
     idatBytes.set(c, off);
     off += c.length;
   }
-  const raw = pakoInflate(idatBytes) as Uint8Array;
-
   const stride = width * channels;
+  // b77m (audit VAR-31): bounded inflate of exactly height x (1 + stride) bytes
+  const raw = inflateExact(idatBytes, height * (stride + 1));
+
   const rgba = new Uint8Array(width * height * 4);
   const row = new Uint8Array(stride);
   const prev = new Uint8Array(stride);

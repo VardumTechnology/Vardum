@@ -18,6 +18,12 @@
  *     endpoints see (email, password) — exactly what the manual flow sent.
  *   - the phrase is already the root secret (it re-derives the identity keys);
  *     deriving the account from it adds no new compromise surface.
+ *   - b77p (audit VAR-38): the password is unsalted and fast ON PURPOSE. Its input is the
+ *     canonical 24-word BIP39 phrase (256 bits of entropy), so there is nothing to search;
+ *     the label keeps it apart from the email derivation (the only value the relay can tie
+ *     to it); the relay stores only a salted PBKDF2 (600k) verifier of it. A salt or slow
+ *     KDF here would add nothing against a 256-bit input and would need a password migration
+ *     on every account. Revisit if the phrase ever gets shorter (spec §8.2 item 62).
  *
  * Server side: provisioning a NEW account without a human reading an OTP
  * email needs the relay function `veilSilentAccount` (action: 'provision')
@@ -26,9 +32,10 @@
  * caller falls back to the classic email flow — build-35 users and the
  * review binary are never blocked.
  */
-import { sha256, utf8, toB64 } from '../../crypto-core/src/index';
+import { sha256, utf8, toB64, ikSign } from '../../crypto-core/src/index';
 import type { VeilRelay } from './relay';
 import type { Base44Auth, AuthSession } from './auth';
+import { relayDetailOf } from './relay-errors'; // b77m (audit VAR-20)
 
 export interface SilentCredentials {
   email: string;
@@ -87,7 +94,8 @@ export interface SilentAuthDeps {
 }
 
 function isUnavailable(e: unknown): boolean {
-  const s = String((e as Error)?.message ?? e).toLowerCase();
+  if ((e as { status?: unknown } | null)?.status === 404) return true; // b77m (audit VAR-20)
+  const s = relayDetailOf(e).toLowerCase();
   // relay rejects unknown functions with "Unknown action"/"not found";
   // anything else (network, lockout, bad credentials) is a REAL failure the
   // caller should surface, not a fallback trigger.
@@ -110,11 +118,11 @@ export async function provisionSilentAccount(deps: SilentAuthDeps, phrase: strin
     // b199: a retry after a half-finished first attempt (account created,
     // app closed before sign-in) finds the account already there — that is
     // success, not an error: sign in with the same derived credentials
-    if (!/already registered/i.test(String((e as Error)?.message ?? e))) throw e;
+    if (!/already registered/i.test(relayDetailOf(e))) throw e; // b77m (audit VAR-20)
   }
-  // standard platform login — may itself demand OTP if the server-side
-  // provisioning half exists but didn't pre-verify; that surfaces to the
-  // caller exactly like a normal login would.
+  // standard platform login. b73 (audit): the Vardum relay has no emailed-code
+  // step (accounts are created pre-verified); any error surfaces to the caller
+  // exactly like a normal login would.
   return deps.auth.login(creds.email, creds.password);
 }
 
@@ -124,9 +132,11 @@ export async function provisionSilentAccount(deps: SilentAuthDeps, phrase: strin
  * no account on this relay (pre-b112 identity, or the account was made the
  * classic way): the caller falls back to the email sign-in.
  */
-export async function silentLogin(deps: SilentAuthDeps, phrase: string): Promise<AuthSession> {
+export async function silentLogin(deps: SilentAuthDeps, phrase: string, opts: { regLockPin?: string } = {}): Promise<AuthSession> {
   const creds = await deriveSilentCredentials(phrase);
-  return deps.auth.login(creds.email, creds.password);
+  // b76 (registration lock): a locked account answers 423 (dev/reglock.ts:regLockInfo); the
+  // caller asks for the PIN and calls again with its proof
+  return deps.auth.login(creds.email, creds.password, opts);
 }
 
 /** b199: true when an account label is a phrase-derived one (never a real
@@ -142,7 +152,47 @@ export function isSilentAccountEmail(email: string | null | undefined): boolean 
  * account switches to 24-word sign-in. Only the derived label + password
  * leave the device; the account's data is untouched.
  */
-export async function rebindSilentAccount(deps: SilentAuthDeps, phrase: string): Promise<void> {
+export async function rebindSilentAccount(
+  deps: SilentAuthDeps,
+  phrase: string,
+  /** b70 (re-review R2): an identity already bound to this account signs the change */
+  signer: { veilId: string; ikSeedB64: string },
+  /** b70 (re-review 3): the identity just made — it becomes the account's primary */
+  nextVeilId = '',
+  /** b77u (audit 6 U-M14): the account's CURRENT password (for a 24-word account, its phrase-derived secret). The relay
+   *  asks for it (403 code current_password_required) when the account's primary was recorded after the account was set
+   *  up (the old first-fresh-binder rule); a primary from the account's onboarding needs only its signature. */
+  opts: { currentPassword?: string } = {},
+): Promise<void> {
   const creds = await deriveSilentCredentials(phrase);
-  await deps.relay.invoke('veilSilentAccount', { action: 'rebind', email: creds.email, password: creds.password });
+  const session = await deps.auth.currentSession();
+  const ts = Date.now();
+  // b75 (audit RL-13): v3 binds the new password too (as a labelled hash, rebindPasswordTag);
+  // v2 left it out, so a captured signed request could be replayed with another password
+  const sig = await ikSign(signer.ikSeedB64, toB64(utf8(`vardum-rebind-v3:${session?.user?.id ?? ''}:${creds.email}:${ts}:${nextVeilId}:${await rebindPasswordTag(creds.password)}`)));
+  await deps.relay.invoke('veilSilentAccount', { action: 'rebind', email: creds.email, password: creds.password, proof: { veil_id: signer.veilId, ts, sig, next_veil_id: nextVeilId }, ...(opts.currentPassword ? { current_password: opts.currentPassword } : {}) });
+  // b76 (registration lock): this phone's device key follows the account to its new label, so the
+  // sign-in below needs no PIN (a lock the rebind ended leaves a key that no longer matters)
+  if (session?.user?.email) await deps.auth.relabelRegLockDevice?.(String(session.user.email), creds.email);
+  // b70 (audit RLY-6): a rebind revokes every token, this one too; sign in again
+  await deps.auth.login(creds.email, creds.password);
+}
+
+/** b75 (audit RL-13): the new password as the rebind proof names it — never the password
+ *  itself: hex(SHA-256(utf8('vardum-rebind-pw-v1:' + password))). Same as the relay's. */
+export async function rebindPasswordTag(password: string): Promise<string> {
+  return [...await sha256(utf8('vardum-rebind-pw-v1:' + password))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** b70 (re-review 3): the account's primary identity names its successor, so a
+ *  sign-in move that could not finish can be retried later with the new ID */
+export async function handoverPrimaryIdentity(
+  deps: SilentAuthDeps,
+  signer: { veilId: string; ikSeedB64: string },
+  nextVeilId: string,
+): Promise<void> {
+  const session = await deps.auth.currentSession();
+  const ts = Date.now();
+  const sig = await ikSign(signer.ikSeedB64, toB64(utf8(`vardum-primary-v1:${session?.user?.id ?? ''}:${nextVeilId}:${ts}`)));
+  await deps.relay.invoke('veilIdentityGate', { action: 'handover', veil_id: signer.veilId, next_veil_id: nextVeilId, ts, sig });
 }

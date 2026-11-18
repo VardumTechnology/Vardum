@@ -1,16 +1,20 @@
 import React from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image, Keyboard } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image, Keyboard, Platform } from 'react-native';
+import { pushServiceChoice, choosePushService } from '../unifiedpush'; // b77m (audit VAR-17)
 import { useKbPadding } from '../hooks/useKbPadding';
 import { PASSWORD_MAX } from '../password';
+import { SecureInput, SecureKeypadHost } from '../components/SecureKeypad'; // b77n (owner, 30 Oct)
+import { PHONE_KEYBOARD_FALLBACK, VARDUM_KEYBOARD_BACK } from '../secret-entry';
 import { useThemedShare } from './ThemedSheets';
 import { VeilQrSheet } from './VeilQr';
 import { Ionicons } from '@expo/vector-icons';
 import { SessionsScreen, type SessionRow } from './SessionsScreen';
 import { ContactsScreen, type ContactRow, type LookupResult, type GroupInviteResult, type ContactChatChoice } from './ContactsScreen';
-import { SettingsScreen } from './SettingsScreen';
+import { SettingsScreen, type MoveOffer, type ReceiveFlow } from './SettingsScreen';
 import { VaultsScreen, NotesScreen, StegoScreen } from './ToolsScreen';
 import type { VeilApp } from '../veil-app';
 import { type VeilSettings } from '../../vendor/device/src/settings';
+import type { RegLockStatus } from '../../vendor/device/src/reglock';
 
 export interface MainScreenProps {
   decoyMode: boolean;
@@ -18,6 +22,8 @@ export interface MainScreenProps {
   email?: string | null;
   busy: boolean;
   onSignOut: () => void;
+  /** b70 (re-review 6): the header button (with a lock set it opens Settings, whose row asks for the password) */
+  onHeaderSignOut?: () => void;
   sessions: SessionRow[];
   onRefreshSessions: () => void;
   onOpenSession: (token: string) => void;
@@ -49,19 +55,38 @@ export interface MainScreenProps {
   onSettingsChange: (s: VeilSettings) => void;
   onRunCheckup: () => void;
   appLockEnabled: boolean;
-  onSetAppLock: (pass: string, decoy?: string | null, duress?: string | null) => Promise<void>;
+  onSetAppLock: (current: string | null, pass: string, decoy?: string | null, duress?: string | null) => Promise<void>;
   onRemoveAppLock: (pass: string) => Promise<boolean>;
+  /** b70 (VAR-01/02/17): password check for account and key actions */
+  onCheckPassword?: (code: string) => Promise<'ok' | 'wrong' | 'wiped'>;
+  /** b70 (VAR-16): the duress code typed at the Notes gate erases the phone */
+  onDuress?: () => Promise<void>;
   onLockNow: () => void;
   onWipeDevice: () => Promise<void>;
   onDeleteAccount: () => Promise<void>;
   onViewIntro: () => void;
   webBaseUrl: string;
-  onCreateTransfer: () => Promise<{ link: string; sessionCount: number; groupCount: number; hasIdentity: boolean }>;
-  onReceiveTransfer: (link: string) => Promise<{ sessionCount: number; importedCount: number; skippedExisting: number; identityImported: boolean; identityKept: boolean }>;
+  /** b75 (audit XF-1): the receiver-bound move (SettingsScreen) */
+  onCreateTransfer: (code: string) => Promise<MoveOffer>;
+  onReceiveTransfer: () => Promise<ReceiveFlow>;
+  getLastMove?: () => Promise<{ at: number; count: number; sas?: string } | null>;
   onVerifyPhrase: (phrase: string) => Promise<boolean>;
   onSwitchToPhraseSignIn?: (phrase: string) => Promise<'ok' | 'wrong-phrase'>;
   onRemoveIdentity: () => Promise<void>;
   onGenerateNewVeilId: () => Promise<void>;
+  /** b76 (registration lock): Settings → Registration lock (undefined in decoy mode) */
+  regLock?: RegLockStatus | null;
+  onRegLockRefresh?: () => Promise<void>;
+  onRegLockSet?: (pin: string) => Promise<void>;
+  onRegLockOff?: () => Promise<void>;
+  /** b76r1 (audit P-4): Settings → one-time keys held by another phone (0 / undefined: not shown) */
+  opkElsewhereSince?: number;
+  onOpkReclaim?: () => Promise<void>;
+  /** b77s (owner decision): Settings > Account, passed through */
+  onSignOutOtherDevices?: () => Promise<number>;
+  onChangeAccountPassword?: (oldPassword: string, newPassword: string) => Promise<number>;
+  /** audit VAR-17: a UnifiedPush distributor was chosen in Settings — register push with it */
+  onPushServiceChosen?: () => Promise<void>;
   onCreateIdentity: () => void;
   /** dismissible in-app "Secure your VEIL" prompt (checkup + app lock) */
   securePrompt: boolean;
@@ -69,11 +94,6 @@ export interface MainScreenProps {
   /** b139 funnel fix: the local "Getting started" welcome thread row */
   welcomeVisible: boolean;
   onOpenWelcome: () => void;
-  /** b196-r5: Founding Tester Forum banner (non-members only) */
-  forumBannerVisible?: boolean;
-  forumBannerBusy?: boolean;
-  onJoinForum?: () => void;
-  onDismissForumBanner?: () => void;
   tab: 'sessions' | 'contacts' | 'vaults' | 'stego' | 'notes' | 'settings';
   onTab: (tab: 'sessions' | 'contacts' | 'vaults' | 'stego' | 'notes' | 'settings') => void;
   app: VeilApp;
@@ -84,38 +104,53 @@ export interface MainScreenProps {
  * The chat pane mounts on session open (next step).
  */
 export function MainScreen({
-  app, decoyMode, veilId, email, busy, onSignOut,
+  app, decoyMode, veilId, email, busy, onSignOut, onHeaderSignOut,
   sessions, onRefreshSessions, onOpenSession, onNewSession, onCreateInvite, onJoinInvite,
   contacts, contactsError, onLookup, onPin, onUnpin, onMessage, onVerify, onSetNickname, onCreateGroup, onOpenContact, myGroups, onAddGroupPeople, prefillAdd, settings, onSettingsChange, onRunCheckup, tab, onTab,
   blockedIds, onUnblock,
-  appLockEnabled, onSetAppLock, onRemoveAppLock,
+  appLockEnabled, onSetAppLock, onRemoveAppLock, onCheckPassword, onDuress,
   onLockNow, onWipeDevice, onDeleteAccount, onViewIntro, webBaseUrl,
-  onCreateTransfer, onReceiveTransfer, onVerifyPhrase, onSwitchToPhraseSignIn, onRemoveIdentity, onGenerateNewVeilId, onCreateIdentity,
+  onCreateTransfer, onReceiveTransfer, getLastMove, onVerifyPhrase, onSwitchToPhraseSignIn, onRemoveIdentity, onGenerateNewVeilId, onCreateIdentity,
+  regLock, onRegLockRefresh, onRegLockSet, onRegLockOff, opkElsewhereSince, onOpkReclaim, onPushServiceChosen, onSignOutOtherDevices, onChangeAccountPassword,
   securePrompt, onDismissSecurePrompt, welcomeVisible, onOpenWelcome,
-  forumBannerVisible, forumBannerBusy, onJoinForum, onDismissForumBanner,
 }: MainScreenProps) {
+  // audit VAR-17: the UnifiedPush choice shown in Settings (Android; read when the tab opens)
+  const [pushSvc, setPushSvc] = React.useState<{ installed: string[]; chosen: string | null; alertsHidden?: boolean } | null>(null);
+  React.useEffect(() => { if (tab === 'settings' && Platform.OS === 'android') setPushSvc(pushServiceChoice()); }, [tab]);
   // b198 (owner direction, battery): NOTES ARE GATED — entering the Notes tab
   // demands the app-lock passcode, every time. The whole-app lock covers the
   // shell; this gate covers the one screen that holds long-lived private
   // text. Re-locks on every tab entry; the app-lock record is the only key.
   const [notesUnlocked, setNotesUnlocked] = React.useState(false);
+  // b70 (VAR-16): the decoy code at the Notes gate opens empty decoy notes
+  const [notesDecoy, setNotesDecoy] = React.useState(false);
   const [notesCode, setNotesCode] = React.useState('');
   const [notesErr, setNotesErr] = React.useState<string | null>(null);
   const [notesBusy, setNotesBusy] = React.useState(false);
+  // b77n (owner, 30 Oct): the app password is typed on the Vardum keypad; the phone keyboard only on request
+  const [notesPhoneKb, setNotesPhoneKb] = React.useState(false);
   // b199: keyboard height for the Notes lock (the tab bar under it is ~58pt tall)
   const kbRaw = useKbPadding();
   const notesKb = Math.max(0, kbRaw - 58);
   // b199: full-screen VEIL QR (opened from the identity card)
   const [qrOpen, setQrOpen] = React.useState(false);
-  React.useEffect(() => { if (tab === 'notes') { setNotesUnlocked(false); setNotesCode(''); setNotesErr(null); } }, [tab]);
+  React.useEffect(() => { if (tab === 'notes') { setNotesUnlocked(false); setNotesDecoy(false); setNotesCode(''); setNotesErr(null); setNotesPhoneKb(false); } }, [tab]);
   const unlockNotes = async () => {
     if (notesBusy || !notesCode) return;
     setNotesBusy(true);
     try {
-      const kind = await app.appLock.verify(notesCode);
-      if (kind === 'real') { setNotesUnlocked(true); setNotesErr(null); setNotesCode(''); }
+      const kind = await app.appLock.verify(notesCode, { decoy: decoyMode }); // re-audit N2
+      // b70 (VAR-16): decoy and duress work here as they do at the lock screen.
+      // In decoy mode even the real code only opens the decoy's notes (b77t2: the decoy account's own).
+      if (kind === 'duress') { setNotesCode(''); await onDuress?.(); return; }
+      // b74 (review VAR-04): in decoy mode only the decoy code opens (the empty decoy
+      // notes); the real code is answered exactly like a wrong one, so this gate can't
+      // be used to test guesses at the real password
+      const opens = decoyMode ? kind === 'decoy' : (kind === 'real' || kind === 'decoy');
+      if (opens) { setNotesDecoy(kind === 'decoy' || decoyMode); setNotesUnlocked(true); setNotesErr(null); setNotesCode(''); }
       else { setNotesErr('Wrong password.'); setNotesCode(''); }
     } catch (e) {
+      if ((e as Error)?.name === 'AppLockErasedError') return; // b74 (VAR-04): the erase already ran
       // Batch D (D-11): verify enforces the shared lockout here too
       const m = String((e as Error)?.message ?? '');
       setNotesErr(/too many|could not be read/i.test(m) ? m : 'Could not verify — try again.');
@@ -139,7 +174,7 @@ export function MainScreen({
           <Image source={require('../../assets/logo.png')} style={styles.logoSmall} />
           <Text style={styles.logo}><Text style={{ color: '#20D9C2' }}>V</Text>ardum</Text>
         </View>
-        <TouchableOpacity onPress={onSignOut} disabled={busy}>
+        <TouchableOpacity onPress={onHeaderSignOut ?? onSignOut} disabled={busy}>
           <Text style={styles.signOut}>{busy ? '…' : 'Sign out'}</Text>
         </TouchableOpacity>
       </View>
@@ -164,7 +199,7 @@ export function MainScreen({
 
       <View style={styles.body}>
         {tab === 'sessions' ? (
-          <SessionsScreen sessions={sessions} busy={busy} onRefresh={onRefreshSessions} onOpenSession={onOpenSession} onNewSession={onNewSession} onCreateInvite={onCreateInvite} onJoinInvite={onJoinInvite} welcomeVisible={welcomeVisible} onOpenWelcome={onOpenWelcome} forumBannerVisible={forumBannerVisible} forumBannerBusy={forumBannerBusy} onJoinForum={onJoinForum} onDismissForumBanner={onDismissForumBanner} identity={{ veilId: veilId ?? null, nickname: settings.nickname, onShare: () => { if (veilId) openShare({ value: veilId, kicker: 'People use it to look you up and start verified conversations.' }); }, onShowQr: () => setQrOpen(true) }} />
+          <SessionsScreen sessions={sessions} busy={busy} onRefresh={onRefreshSessions} onOpenSession={onOpenSession} onNewSession={onNewSession} onCreateInvite={onCreateInvite} onJoinInvite={onJoinInvite} welcomeVisible={welcomeVisible} onOpenWelcome={onOpenWelcome} identity={{ veilId: veilId ?? null, nickname: settings.nickname, onShare: () => { if (veilId) openShare({ value: veilId, kicker: 'People use it to look you up and start verified conversations.' }); }, onShowQr: () => setQrOpen(true) }} />
         ) : tab === 'contacts' ? (
           <ContactsScreen contacts={contacts} busy={busy} error={contactsError} onLookup={onLookup} onPin={onPin} onUnpin={onUnpin} onMessage={onMessage} onVerify={onVerify} onSetNickname={onSetNickname} onCreateGroup={onCreateGroup} onOpenContact={onOpenContact} myGroups={myGroups} onAddGroupPeople={onAddGroupPeople} prefillAdd={prefillAdd} />
         ) : tab === 'vaults' ? (
@@ -183,7 +218,8 @@ export function MainScreen({
             // b199 (owner, Oct 16): big lock mark + words; the slim bar at the
             // bottom IS the password field — tapping it opens the dark iPhone
             // keyboard (any characters, up to 50; AutoFill and saving are off).
-            <View style={[styles.notesGateFull, notesKb > 0 ? { paddingBottom: notesKb } : null]}>
+            <SecureKeypadHost>
+            <View style={[styles.notesGateFull, notesPhoneKb && notesKb > 0 ? { paddingBottom: notesKb } : null]}>
               <TouchableOpacity style={styles.notesGateTop} activeOpacity={1} onPress={() => Keyboard.dismiss()}>
                 <View style={[styles.notesGateIconBig, notesKb > 0 && styles.notesGateIconSmall]}><Ionicons name="document-lock-outline" size={notesKb > 0 ? 30 : 46} color="#FFFFFF" /></View>
                 <Text style={styles.notesGateTitleBig}>Notes are locked</Text>
@@ -192,6 +228,22 @@ export function MainScreen({
               <Text style={styles.notesGateErr}>{notesBusy ? 'Checking…' : (notesErr ?? '')}</Text>
               <View style={[styles.notesBar, notesCode.length > 0 && styles.notesBarOn]}>
                 <Ionicons name="lock-closed-outline" size={18} color={notesCode.length > 0 ? '#FFFFFF' : '#8E9696'} />
+                {!notesPhoneKb ? (
+                  <View style={styles.notesBarKeypad}>
+                    <SecureInput
+                      textStyle={styles.notesBarKeypadTxt}
+                      value={notesCode}
+                      onChangeText={(t) => { setNotesErr(null); setNotesCode(t.slice(0, PASSWORD_MAX)); }}
+                      onSubmit={unlockNotes}
+                      stayOpen
+                      doneLabel="Unlock"
+                      editable={!notesBusy}
+                      maxLength={PASSWORD_MAX}
+                      placeholder="Enter password"
+                      accessibilityLabel="Password"
+                    />
+                  </View>
+                ) : (
                 <TextInput
                   style={styles.notesBarInput}
                   value={notesCode}
@@ -212,28 +264,43 @@ export function MainScreen({
                   importantForAutofill="no"
                   accessibilityLabel="Password"
                 />
+                )}
               </View>
+              <TouchableOpacity style={styles.notesKbSwitch} onPress={() => { setNotesCode(''); setNotesPhoneKb(!notesPhoneKb); }} accessibilityRole="button">
+                <Text style={styles.notesKbSwitchTxt}>{notesPhoneKb ? VARDUM_KEYBOARD_BACK : PHONE_KEYBOARD_FALLBACK}</Text>
+              </TouchableOpacity>
               <TouchableOpacity style={[styles.notesGateBtn, styles.notesGateBtnBar, (notesBusy || !notesCode) && styles.notesGateBtnOff]} disabled={notesBusy || !notesCode} onPress={unlockNotes}>
                 <Text style={styles.notesGateBtnTxt}>{notesBusy ? 'Checking…' : 'Unlock Notes'}</Text>
               </TouchableOpacity>
             </View>
+            </SecureKeypadHost>
           ) : (
-            <NotesScreen app={app} decoy={decoyMode} veilId={veilId} />
+            // b77t2 (decoy gaps): in a decoy session `app` is the decoy's own account, so its notes are real notes of
+            // that account (as in a fresh Vardum). The decoy code at the REAL Notes gate still opens the empty view
+            <NotesScreen app={app} decoy={!decoyMode && notesDecoy} veilId={veilId} privateKeyboard={settings.privateKeyboard} />
           )
         ) : tab === 'stego' ? (
-          <StegoScreen storage={app.storage} />
+          <StegoScreen storage={decoyMode ? undefined : app.storage} /* b70 (re-review 5): decoy saves never touch the real list */ privateKeyboard={settings.privateKeyboard} />
         ) : (
           <SettingsScreen
             settings={settings} onChange={onSettingsChange} veilId={veilId} email={email}
             onRunCheckup={onRunCheckup} appLockEnabled={appLockEnabled}
-            onSetAppLock={onSetAppLock} onRemoveAppLock={onRemoveAppLock}
-            onSignOut={onSignOut} onLockNow={onLockNow} onWipeDevice={onWipeDevice}
+            onSetAppLock={onSetAppLock} onRemoveAppLock={onRemoveAppLock} onCheckPassword={onCheckPassword}
+            onSignOut={onSignOut} onLockNow={onLockNow} onWipeDevice={onWipeDevice} lockOptionsFixed={decoyMode} /* b77t2 (decoy gaps) */
             onDeleteAccount={onDeleteAccount} onViewIntro={onViewIntro} onOpenWelcome={onOpenWelcome} webBaseUrl={webBaseUrl}
             onOpenTools={() => onTab('vaults')} onOpenContacts={() => onTab('contacts')}
-            onCreateTransfer={onCreateTransfer} onReceiveTransfer={onReceiveTransfer}
+            onCreateTransfer={onCreateTransfer} onReceiveTransfer={onReceiveTransfer} getLastMove={getLastMove}
             onVerifyPhrase={onVerifyPhrase} onSwitchToPhraseSignIn={onSwitchToPhraseSignIn} onRemoveIdentity={onRemoveIdentity}
             onGenerateNewVeilId={onGenerateNewVeilId} onCreateIdentity={onCreateIdentity} onShowQr={() => setQrOpen(true)}
             blockedIds={blockedIds} onUnblock={onUnblock}
+            regLock={regLock} onRegLockRefresh={onRegLockRefresh} onRegLockSet={onRegLockSet} onRegLockOff={onRegLockOff}
+            opkElsewhereSince={opkElsewhereSince} onOpkReclaim={onOpkReclaim} onSignOutOtherDevices={onSignOutOtherDevices} onChangeAccountPassword={onChangeAccountPassword}
+            pushService={pushSvc}
+            onChoosePushService={onPushServiceChosen ? async (pkg: string) => {
+              if (!choosePushService(pkg)) return;
+              setPushSvc(pushServiceChoice());
+              await onPushServiceChosen().catch(() => undefined);
+            } : undefined}
           />
         )}
       </View>
@@ -307,6 +374,10 @@ const styles = StyleSheet.create({
   notesBarOn: { borderColor: '#3A3A44' },
   notesBarTxt: { color: '#8E9696', fontSize: 15 },
   notesBarInput: { flex: 1, color: '#FFFFFF', fontSize: 16, paddingVertical: 12 },
+  notesBarKeypad: { flex: 1 },
+  notesBarKeypadTxt: { fontSize: 16 },
+  notesKbSwitch: { paddingVertical: 8 },
+  notesKbSwitchTxt: { color: '#8E9696', fontSize: 12, textAlign: 'center' },
   notesGateIconSmall: { width: 64, height: 64, borderRadius: 32, marginBottom: 12 },
   notesGateBtnBar: { alignSelf: 'stretch', maxWidth: undefined, marginTop: 10 },
   notesBarDots: { flexDirection: 'row', gap: 9 },

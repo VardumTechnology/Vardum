@@ -1,12 +1,31 @@
+import { burnAnchor } from '../burn-anchor'; // b77p (audit 2, VAR-03)
 import React, { memo, useEffect, useRef, useState } from 'react';
+import { titleInitials } from '../../vendor/device/src/names'; // b77k2: initials without the isolate marks
 import { burnCountdownText } from '../burn';
-import { ScrollView, View, Text, TextInput, TouchableOpacity, Pressable, FlatList, StyleSheet, Platform, Image, Modal, ActivityIndicator, Keyboard } from 'react-native';
+import { isolateName } from '../../vendor/device/src/names';
+import { mediaDisplayName } from '../media-name'; // b77q (audit 3 AQ-2)
+import { parseCapturePayload, captureNoticeText } from '../../vendor/device/src/capture-notice';
+import { ScrollView, View, Text, TextInput, TouchableOpacity, Pressable, FlatList, StyleSheet, Platform, Image, ActivityIndicator, Keyboard } from 'react-native';
+import { SecureOverlay } from '../components/SecureOverlay'; // audit VAR-02
+/** audit VAR-42 (1f51): the save toggle is a request the recipient's Vardum honours, not a lock */
+export const SAVE_TOGGLE_NOTE = 'Off hides Save in their Vardum app. It can’t stop a modified app or a photo of the screen.';
+/** b77t (audit 5 M-F / IH C-01): the confirmed-panel text. The gate is one-sided: it says what this phone knows */
+/**
+ * b77u (audit 6 U-M15 / R4 #29): a 1:1 chat that isn't with a contact whose key this phone pinned (an invite-link
+ * chat, a request from a stranger). An invite link isn't tied to one person and the joiner takes the inviter's keys
+ * from the server, so the safety-code comparison is the only thing that would catch a server swapping them. Shown in
+ * the safety-code panel and over the locked composer (sending stays locked on this phone until the code is confirmed).
+ */
+export const UNPINNED_KEYS_NOTE = 'This chat’s keys came to this phone through the server, and they aren’t a contact’s key you saved. For a chat started from an invite link, comparing this safety code with the other person is the only check that the server didn’t swap them. That is why sending stays locked on this phone until you confirm it.';
+export const CONFIRMED_PANEL_TEXT = 'You confirmed the safety code on this phone ✓\nSending from this phone is unlocked. Vardum can’t tell whether the other person has confirmed it on their phone: until they do, their sending stays locked.';
 import { useKbPadding } from '../hooks/useKbPadding';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
-import * as Clipboard from 'expo-clipboard';
+import { copySensitive } from '../clipboard-guard';
 import { useThemedChooser } from './ThemedSheets';
 import { useThemedPrompt } from './ThemedPrompt';
+import { privateComposerProps } from '../secret-entry'; // b77m (audit VAR-14)
+import { CHAT_UNAVAILABLE_TEXT, CHAT_ENDED_BY_PEER_TEXT } from '../chat-end'; // b77m merge (audit VAR-07); b77m review (L9)
 
 // b69: Android saves through the system folder picker (no gallery permission)
 const SAVE_MEDIA_LABEL = Platform.OS === 'android' ? 'Save to…' : 'Save to Photos';
@@ -39,6 +58,9 @@ export interface ChatMessageUI {
   sender?: string;
   /** b62 groups: per-sender Ed25519 signature verified against the roster */
   senderVerified?: boolean;
+  /** b75 (audit GR-4): signed by the group creator's key as this phone holds it — the badge is
+   *  drawn by the app, apart from the name, so a member's chosen name can't copy it */
+  senderCreator?: boolean;
   /** b62 groups: centered system line (member joined / keys rotated / sig discard) */
   systemNote?: string;
   /** b72: epoch ms this message was first displayed here — burn-countdown anchor */
@@ -47,6 +69,8 @@ export interface ChatMessageUI {
   groupInvite?: { name: string; link: string; from?: string };
   /** b199: reactions — one per side */
   reactions?: { mine?: string; peer?: string };
+  /** b77r1 (audit A-5): mine, encrypted, still waiting for the peer's phone to finish setting up */
+  queued?: boolean;
 }
 
 /** b199 (owner request, Oct 17): the quick reactions on a held message */
@@ -55,14 +79,20 @@ const REACTIONS = ['👍', '👎', '❤️', '🙏', '😂', '😮'];
 /** b62 groups: admin + roster context for group threads */
 export interface ChatGroupInfoUI {
   isCreator: boolean;
-  /** Batch F (R4-2-01): the forum — no key rotation; "Remove" blocks and removes posts */
-  forum?: boolean;
   epoch: number;
   fingerprint: string | null;
-  members: { veilId: string; nick?: string; ikPub: string; role: string; joinedEpoch: number; tag: string }[];
+  members: { veilId: string; nick?: string; ikPub: string; role: string; joinedEpoch: number; tag: string;
+    /** b75 (audit GR-1): member view — said they are leaving; the creator hasn't removed them yet */
+    leaving?: boolean;
+    /** b74 (VAR-05): creator view — gone from the relay's roster since (ms); may have left */
+    goneSince?: number }[];
   busy: boolean;
   onRotate: () => Promise<void>;
   onEvict: (member: { veilId: string; ikPub: string }) => Promise<void>;
+  /** b71 (audit F-07): creator — people who opened an invite link and wait for approval */
+  pendingRequests?: { ikPub: string; veilId: string; label: string; via: 'link' | 'contact'; contactLine?: string }[];
+  onApproveRequest?: (ikPub: string) => Promise<void>;
+  onDeclineRequest?: (ikPub: string) => Promise<void>;
 }
 
 export interface PendingPick {
@@ -75,6 +105,8 @@ export interface PendingPick {
 }
 
 export interface ChatScreenProps {
+  /** b70 (audit L-6): no autocorrect, suggestions or keyboard learning */
+  privateKeyboard?: boolean;
   title: string;
   subtitle: string;
   status: 'pending' | 'active' | 'ended';
@@ -92,17 +124,16 @@ export interface ChatScreenProps {
   onSend: () => void;
   /** b199: hold a message to react (pairwise threads); omitted = off */
   onReactMessage?: (id: string, emoji: string) => void;
-  /** Play UGC: long-press menu on someone else's group / forum message (each optional) */
-  onReportMessage?: (id: string, reason: string) => Promise<void>;
+  /** Play UGC: long-press menu on someone else's group message */
   onBlockSender?: (id: string) => Promise<void>;
-  /** forum founder only: remove a post for everyone */
-  onRemoveMessage?: (id: string) => Promise<void>;
   /** Play UGC: block this 1:1 contact (⋯ sheet; ends the chat) */
   onBlockContact?: () => void;
   onBack: () => void;
   /** b144 W3: start an encrypted call on this thread (1:1, ready threads only) */
   onStartCall?: () => void;
   onEndSession: () => void;
+  /** audit VAR-24: the group creator's explicit "End group for everyone" (absent for members and 1:1) */
+  onEndGroupForAll?: () => void;
   onAttach: () => void;
   pendingPick: PendingPick | null;
   onSendMedia: () => void;
@@ -130,17 +161,15 @@ export interface ChatScreenProps {
   contact?: boolean;
   /** per-session verify ceremony state (web parity: 'Verified for this session') */
   myVerified: boolean;
-  peerVerified: boolean;
   /** b161 (parity handoff): resolves true only when the RELAY confirms our slot's
    *  verified flag — the panel stays open and shows an INLINE retry on false. */
-  onVerifySession: () => Promise<boolean>;
+  /** the safety code the user compared (what this screen shows) */
+  onVerifySession: (shownFingerprint: string) => Promise<boolean>;
   /** b126: session fingerprint — viewable in the panel pre AND post verification */
   sessionFingerprint?: string | null;
   /** b126: peer veil id (pairwise only) — gates the "Pin as contact" affordance */
   peerVeilId?: string | null;
   /** b126: peer already pinned — flips the panel button to "Pinned" */
-  readOnly?: boolean;
-  textOnly?: boolean;
   peerPinned?: boolean;
   /** b126: promote the session peer into the permanent contacts (pins table) */
   onPinContact?: () => void;
@@ -160,11 +189,30 @@ export interface ChatScreenProps {
   canRename?: boolean;
   threadNickname?: string | null;
   onRenameThread?: (name: string) => void;
+  /** b71 (audit): a contact request from a Vardum ID that isn't pinned — nothing
+   *  happens until the user taps Accept (or Decline) */
+  request?: boolean;
+  onAcceptRequest?: () => Promise<boolean>;
+  /** b76r2 (ZTE battery, ZTE-5): this phone's keys for the thread are gone (Nothing-at-Rest, a wipe)
+   *  and the handshake failed closed — it can never work here; say so and offer the way out */
+  unrecoverable?: boolean;
+  /** b77r1 (audit A-5): this 1:1 chat couldn't finish setting up (the relay kept refusing this
+   *  phone's mailbox ticket, or messages waited past the other phone's last chance) — say so
+   *  and offer End, as for an unrecoverable chat */
+  setupFailed?: boolean;
+  /** b77m merge (audit VAR-07): the relay reports this 1:1 chat no longer exists (nothing from the peer said
+   *  so) — read-only with its history; the banner offers Delete (onEndSession, which sends nothing for it) */
+  unavailable?: boolean;
+  /** b77m review (L9): the chat is read-only because the other person ended it (messages arrived with the end) */
+  endedByPeer?: boolean;
+  /** b77n (pre-audit INFO-5): "Check again" on the unavailable banner (relay's word only; absent after the peer's END) */
+  onCheckAgain?: () => void;
+  onDeclineRequest?: () => void;
 }
 
 function mediaCaption(m: ChatMediaUI): string {
   const mb = (m.size / 1048576).toFixed(1);
-  return `${m.name || 'media'} · ${mb} MB${m.dl ? ' · saving allowed' : ''}`;
+  return `${mediaDisplayName(m.name) || 'media'} · ${mb} MB${m.dl ? ' · saving allowed' : ''}`;
 }
 
 function fmtSecs(n: number): string {
@@ -224,7 +272,7 @@ interface MessageRowProps {
   onReactOpen?: (id: string) => void;
   reactOpen?: boolean;
   onReact?: (id: string, emoji: string) => void;
-  /** Play UGC: long-press menu (report / block / remove); undefined = off */
+  /** Play UGC: long-press menu (block); undefined = off */
   onMenu?: (id: string) => void;
 }
 
@@ -332,11 +380,13 @@ const MessageRow = memo(function MessageRow({
     // signature discard) — same visual family as the capture notice
     return <Text style={styles.captureNotice}>{item.systemNote}</Text>;
   }
-  if (item.text && item.text.startsWith('\u26a0')) {
-    // b61: capture notice (screenshot/recording) — a centered system
-    // line, not a chat bubble. Travels as a normal E2EE message so
-    // web peers see the plain text too.
-    return <Text style={styles.captureNotice}>{item.text}</Text>;
+  // b75r2 (audit P-1): a capture notice (screenshot/recording) is a typed payload, never
+  // inferred from the text (b61 drew any text starting with a warning sign as an
+  // unattributed system line, so a peer could type one). The words are written here and
+  // name who it was.
+  const capture = parseCapturePayload(item.text);
+  if (capture) {
+    return <Text style={styles.captureNotice}>{captureNoticeText(capture, item.mine, item.sender)}</Text>;
   }
   if (item.groupInvite) {
     // b199: group invitation sent privately inside this encrypted chat
@@ -345,16 +395,16 @@ const MessageRow = memo(function MessageRow({
       <View style={[styles.bubbleRow, item.mine ? styles.mineRow : styles.peerRow]}>
         <View style={styles.inviteCard}>
           <Text style={styles.inviteKicker}>Group invitation</Text>
-          <Text style={styles.inviteName} numberOfLines={2}>{inv.name}</Text>
+          <Text style={styles.inviteName} numberOfLines={2}>{isolateName(inv.name) || 'Group' /* audit VAR-58: peer-chosen, cleaned and isolated */}</Text>
           {item.mine ? (
-            <Text style={styles.inviteSub}>You invited them. Only their phone can take this seat. The link carries the group’s key, so keep it private.</Text>
+            <Text style={styles.inviteSub}>{/* b71 (audit): links carry no group key since b71 (review P-01) — the old text said they did */}You invited them. Only their phone can take this seat, and they get the group’s keys once they join.</Text>
           ) : inviteStatus === 'joined' ? (
             <Text style={styles.inviteDone}>✓ Joined — find it in Conversations</Text>
           ) : inviteStatus === 'declined' ? (
             <Text style={styles.inviteSub}>Declined</Text>
           ) : (
             <>
-              <Text style={styles.inviteSub}>You've been invited to join this group. This seat is for you.</Text>
+              <Text style={styles.inviteSub}>You've been invited to join this group.{/* b77q (audit 3 AQ-4): "This seat is for you" went: nothing checked it against the link */}</Text>
               {inviteStatus === 'error' ? <Text style={styles.inviteErr}>Couldn't join — the invite may have expired. Ask for a new one.</Text> : null}
               <View style={styles.inviteActions}>
                 <TouchableOpacity style={styles.inviteJoin} onPress={() => onJoinInvite?.(item.id, inv.link)} disabled={inviteStatus === 'joining'}>
@@ -397,7 +447,7 @@ const MessageRow = memo(function MessageRow({
           {!item.media && item.text ? (
             <TouchableOpacity
               style={styles.reactBtn}
-              onPress={() => { Clipboard.setStringAsync(item.text).catch(() => undefined); onReactOpen?.(item.id); }}
+              onPress={() => { copySensitive(item.text).catch(() => undefined); onReactOpen?.(item.id); }} /* b70 (L-6): cleared after 60 s */
               accessibilityLabel="Copy message text"
             >
               <Ionicons name="copy-outline" size={20} color="#FFFFFF" />
@@ -412,13 +462,14 @@ const MessageRow = memo(function MessageRow({
       >
         {group && !item.mine && item.sender ? (
           <Text style={styles.senderLbl}>
-            {item.sender}{item.senderVerified ? ' ✓' : ''}
+            {isolateName(item.sender) /* b71 (audit): no hidden characters, can't reorder the text around it */}{item.senderVerified ? ' ✓' : ''}
+            {item.senderCreator ? <Text style={styles.creatorBadge}>{'  CREATOR'}</Text> : null}
           </Text>
         ) : null}
         {item.media ? (
           <>
             {renderMedia()}
-            <Text style={styles.mediaCaption}>{mediaCaption(item.media)}</Text>
+            <Text style={styles.mediaCaption} numberOfLines={1}>{mediaCaption(item.media)}</Text>
           </>
         ) : (
           <Text style={item.mine ? styles.mineText : styles.peerText}>{item.text}</Text>
@@ -429,10 +480,11 @@ const MessageRow = memo(function MessageRow({
             {/* b123: read-receipt tick — teal ✓ read, replacing the washed-out
                 plain " · read" text (owner live-test ask, Sept 24). */}
             {item.mine && item.read ? <Text style={styles.readTick}>  ✓ read</Text> : null}
-            {/* b198 two-dial: the SENDER's countdown only exists once the peer's
-                read receipt landed (openedAt restamped at receipt) — pre-receipt
-                there is no burn clock to show, matching the relay copy */}
-            {burnAfterOpen && !item.systemNote && (!item.mine || item.read) ? <BurnCountdown openedAt={item.openedAt} burnSeconds={burnSeconds ?? 86400} /> : null}
+            {/* b77r1 (audit A-5): never shown as sent while it only waits in the outbox */}
+            {item.mine && item.queued && !item.read ? <Text style={styles.queuedTick}>  · Spacing out this new chat so it's harder to link to you (usually under a minute)</Text> : null}
+            {/* b77p (audit 2, VAR-03): the sender's copy burns from the send time (receipts or not),
+                so its countdown runs from min(send time, receipt) and shows on unread own rows too */}
+            {burnAfterOpen && !item.systemNote ? <BurnCountdown openedAt={burnAnchor(item)} burnSeconds={burnSeconds ?? 86400} /> : null}
           </Text>
         ) : null}
       </Pressable>
@@ -449,8 +501,8 @@ const MessageRow = memo(function MessageRow({
   // re-render the row (that's the shake). Callbacks excluded by design.
   const ai = a.item, bi = b.item;
   if (ai.id !== bi.id || ai.text !== bi.text || ai.mine !== bi.mine || ai.ts !== bi.ts
-    || ai.read !== bi.read || ai.sender !== bi.sender || ai.senderVerified !== bi.senderVerified
-    || ai.systemNote !== bi.systemNote || ai.openedAt !== bi.openedAt) return false;
+    || ai.read !== bi.read || ai.sender !== bi.sender || ai.senderVerified !== bi.senderVerified || ai.senderCreator !== bi.senderCreator
+    || ai.systemNote !== bi.systemNote || ai.openedAt !== bi.openedAt || !!ai.queued !== !!bi.queued) return false;
   if ((ai.reactions?.mine ?? '') !== (bi.reactions?.mine ?? '') || (ai.reactions?.peer ?? '') !== (bi.reactions?.peer ?? '')
     || a.reactOpen !== b.reactOpen || !!a.onReact !== !!b.onReact || !!a.onMenu !== !!b.onMenu) return false;
   if ((ai.groupInvite?.link ?? '') !== (bi.groupInvite?.link ?? '') || a.inviteStatus !== b.inviteStatus) return false;
@@ -464,40 +516,22 @@ const MessageRow = memo(function MessageRow({
   return true;
 });
 
-export function ChatScreen({ title, subtitle, status, busy, error, historyNotice, messages, threadKey, onDismissError, draft, onDraftChange, onSend, onBack, onStartCall, onEndSession, canNewThread, onNewThread, contact, myVerified, peerVerified, onVerifySession, onAttach, pendingPick, onSendMedia, onCancelPick, allowDl, onAllowDlChange, onMediaRetry, onMediaSave, mediaSaving, voiceRec, onVoiceRecord, onVoiceCancel, onVoiceSend, group, burnAfterOpen, burnSeconds, showVerifyCard, onVerifyCardDismiss, canRename, threadNickname, onRenameThread, sessionFingerprint, peerVeilId, peerPinned,
-  readOnly, textOnly, onPinContact, inviteState, onJoinGroupInvite, onDeclineGroupInvite, onReactMessage,
-  onReportMessage, onBlockSender, onRemoveMessage, onBlockContact }: ChatScreenProps) {
-  // Play UGC (18 Oct 2026): long-press someone else's group / forum message ->
-  // report it to the founder, block its sender, or (founder) remove it for
-  // everyone. Rows get one stable callback; the live props ride a ref.
+export function ChatScreen({ title, subtitle, status, busy, error, historyNotice, messages, threadKey, onDismissError, draft, onDraftChange, onSend, onBack, onStartCall, onEndSession, onEndGroupForAll, canNewThread, onNewThread, contact, myVerified, onVerifySession, onAttach, pendingPick, onSendMedia, onCancelPick, allowDl, onAllowDlChange, onMediaRetry, onMediaSave, mediaSaving, voiceRec, onVoiceRecord, onVoiceCancel, onVoiceSend, group, burnAfterOpen, burnSeconds, showVerifyCard, onVerifyCardDismiss, canRename, threadNickname, onRenameThread, sessionFingerprint, peerVeilId, peerPinned,
+  onPinContact, inviteState, onJoinGroupInvite, onDeclineGroupInvite, onReactMessage,
+  onBlockSender, onBlockContact, privateKeyboard, request, onAcceptRequest, onDeclineRequest, unrecoverable, setupFailed, unavailable, endedByPeer, onCheckAgain }: ChatScreenProps) {
+  // Play UGC (18 Oct 2026): long-press someone else's group message -> block
+  // its sender. Rows get one stable callback; the live props ride a ref.
   const { node: chooserNode, choose } = useThemedChooser();
   const { node: promptNode, ask } = useThemedPrompt();
-  const menuRef = useRef({ onReportMessage, onBlockSender, onRemoveMessage, messages });
-  menuRef.current = { onReportMessage, onBlockSender, onRemoveMessage, messages };
-  const hasMessageMenu = !!(onReportMessage || onBlockSender || onRemoveMessage);
+  const menuRef = useRef({ onBlockSender, messages });
+  menuRef.current = { onBlockSender, messages };
+  const hasMessageMenu = !!onBlockSender;
   const onMessageMenu = React.useCallback(async (id: string) => {
-    const { onReportMessage: report, onBlockSender: block, onRemoveMessage: remove, messages: list } = menuRef.current;
+    const { onBlockSender: block, messages: list } = menuRef.current;
     const item = list.find((m) => m.id === id);
     if (!item || item.mine || item.systemNote) return;
     const who = item.sender || 'this sender';
     const actions: { label: string; sub?: string; run: () => Promise<void> }[] = [];
-    if (remove) actions.push({ label: 'Remove for everyone', sub: 'Deletes this post from the forum on every phone', run: async () => {
-      const ok = await ask({ title: 'Remove this post for everyone?', message: 'It disappears from the forum on every phone running a current Vardum. This can’t be undone.', confirm: true, danger: true, submitLabel: 'Remove' });
-      if (ok === true) await remove(id);
-    } });
-    if (report) actions.push({ label: 'Report post', sub: 'Only the founder can read it', run: async () => {
-      const reasons = ['Abuse or harassment', 'Hate or threats of violence', 'Sexual content', 'Spam or scam', 'Something else'];
-      const r = await choose({ title: 'Report this post', message: 'What you write and a copy of the post go only to the forum founder, end-to-end encrypted. The server and other forum members can see that you sent a report, but not what it says. The person you report isn’t notified.', options: reasons.map((label) => ({ label })) });
-      if (r === null) return;
-      let reason = reasons[r];
-      if (r === reasons.length - 1) {
-        const t = await ask({ title: 'What’s wrong with this post?', input: 'text', placeholder: 'A few words (optional)', maxLength: 300, submitLabel: 'Send report' });
-        if (t === null || t === false) return;
-        reason = String(t).trim() ? `Something else: ${String(t).trim()}` : 'Something else';
-      }
-      await report(id, reason);
-      await ask({ title: 'Report sent', message: 'Thank you. It goes to the founder’s phone and is opened in turn, so it may take a while. You can also block the sender from the same menu.', info: true });
-    } });
     if (block) actions.push({ label: `Block ${who}`, sub: 'Hide their posts and messages on this phone', run: async () => {
       const ok = await ask({ title: `Block ${who}?`, message: 'You won’t see their posts or messages on this phone, and they won’t notify you. They aren’t told. You can unblock them in Settings.', confirm: true, danger: true, submitLabel: 'Block' });
       if (ok === true) await block(id);
@@ -676,17 +710,15 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
     if (messages.length) listRef.current?.scrollToEnd?.({ animated: false });
   }, [messages.length]);
 
-  // b163 (web P1.2 parity, owner decision Oct 2): sending requires BOTH sides'
-  // fingerprint ceremony on EVERY pairwise path — pinned contact threads no
-  // longer send on keys alone. Groups are exempt: their trust anchor is the
+  // b163: sending requires the fingerprint ceremony on EVERY pairwise path — pinned contact
+  // threads no longer send on keys alone. Groups are exempt: their trust anchor is the
   // group signature scheme, not a pairwise ceremony.
-  const verifyGate = !group && !(myVerified && peerVerified);
-  const composerLocked = readOnly || status !== 'active' || busy || verifyGate;
-  // b187: lounge read-only notice — the composer is locked by design; this
-  // replaces any silence with the honest reason, styled as a soft system note.
-  const loungeNote = readOnly
-    ? 'Founder broadcast — only Matt posts here. Replies open when member groups land.'
-    : (textOnly ? 'Founding testers forum — end-to-end encrypted. Photos and voice notes land in the next build.' : null);
+  // b71 (audit): the gate is the confirmation sealed on THIS phone.
+  // b77t (audit 5 M-F / IH C-01, owner decision "until you confirm"): the gate is one-sided. Each phone
+  // locks its own sending until ITS user confirms; nothing tells this phone whether the other person
+  // has confirmed (the old server flag is gone), and no text here says otherwise.
+  const verifyGate = !group && !myVerified;
+  const composerLocked = status !== 'active' || busy || verifyGate;
 
   // (b66) the ✕ sheet is now VEIL-styled instead of the plain system action
   // sheet: End renders as a true RED destructive button (the system sheet showed
@@ -699,6 +731,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
   const [verifyPanel, setVerifyPanel] = useState<'ceremony' | 'view' | null>(null);
   /** b161: panel-LOCAL verify failure — never the app-wide error state (suppression rule). */
   const [verifyFail, setVerifyFail] = useState(false);
+  /** b71 (audit): the Accept tap on a contact request is running */
+  const [reqBusy, setReqBusy] = useState(false);
   const [compareArmed, setCompareArmed] = useState(false);
   // b123: local thread rename (device-local nickname against the peer veil-id)
   const [renameOpen, setRenameOpen] = useState(false);
@@ -726,29 +760,29 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
           <Ionicons name="chevron-back" size={26} color="#FFFFFF" />
         </TouchableOpacity>
         <View style={[styles.hAvatar, group && styles.hAvatarGroup]}>
-          <Text style={styles.hAvatarTxt}>{group ? '#' : title.slice(0, 2).toUpperCase()}</Text>
+          <Text style={styles.hAvatarTxt}>{group ? '#' : titleInitials(title).toUpperCase()}</Text>
         </View>
         <View style={styles.headerMid}>
-          <Text style={styles.title} numberOfLines={1}>{title}</Text>
+          <Text style={styles.title} numberOfLines={1}>{isolateName(title)}</Text>
           {status === 'pending' || status === 'ended' ? (
-            <Text style={styles.subtitle} numberOfLines={1}>{status === 'pending' ? 'Waiting for your contact to accept…' : 'Session ended'}</Text>
+            <Text style={styles.subtitle} numberOfLines={1}>{status === 'pending' ? (request ? 'Wants to chat · not in your contacts' : 'Waiting for your contact to accept…') : unavailable ? 'No longer available' : 'Session ended'}</Text>
           ) : null}
           {group ? (
             <TouchableOpacity style={styles.vBadge} onPress={() => setGroupPanel(true)} hitSlop={{ top: 10, bottom: 10 }}>
               <Text style={styles.vBadgeTxtGroup}>Members · epoch {group.epoch} ›</Text>
             </TouchableOpacity>
-          ) : status !== 'ended' ? (
+          ) : status !== 'ended' && !request ? (
             /* b163 (web P1.2 parity): pinned contact threads show the SAME
              * ceremony state as invite threads — the 'Pinned contact' trust
-             * chip is gone; sending unlocks only when both sides confirm.
+             * chip is gone; sending from this phone unlocks once you confirm (b77t M-F: one-sided).
              * The pin still anchors identity (panel shows the pinned state);
              * the ceremony is the human comparison on top of it. */
             <TouchableOpacity
-              style={[styles.vBadge, myVerified && peerVerified ? styles.vBadgeOk : myVerified || peerVerified ? styles.vBadgeHalf : styles.vBadgeNone]}
+              style={[styles.vBadge, myVerified ? styles.vBadgeOk : styles.vBadgeNone]}
               onPress={() => { setCompareArmed(false); setVerifyPanel(myVerified ? 'view' : 'ceremony'); }}
             >
-              <Text style={[styles.vBadgeTxt, myVerified && peerVerified ? styles.vBadgeTxtOk : myVerified || peerVerified ? styles.vBadgeTxtHalf : styles.vBadgeTxtNone]}>
-                {myVerified && peerVerified ? '✓ Verified' : myVerified ? 'You verified · waiting for peer' : peerVerified ? 'Peer verified · tap to verify' : 'Not verified'}
+              <Text style={[styles.vBadgeTxt, myVerified ? styles.vBadgeTxtOk : styles.vBadgeTxtNone]}>
+                {myVerified ? '✓ Safety code confirmed' : 'Safety code not confirmed'}
               </Text>
             </TouchableOpacity>
           ) : null}
@@ -786,9 +820,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
               ) : group.members.map((m) => (
                 <View key={m.veilId} style={styles.groupMemberRow}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.groupMemberName}>{m.nick ? m.nick : m.veilId.slice(0, 10) + '…'}</Text>
+                    <Text style={styles.groupMemberName}>{m.nick ? isolateName(m.nick) : m.veilId.slice(0, 10) + '…'}</Text>
                     {!!m.nick && <Text style={styles.groupMemberMeta}>{m.veilId.slice(0, 10)}…</Text>}
-                    <Text style={styles.groupMemberMeta}>{m.role === 'creator' ? 'Creator' : m.role === 'pending' ? 'Waiting to be confirmed — no group keys yet' : 'Member'} · joined epoch {m.joinedEpoch}</Text>
+                    <Text style={styles.groupMemberMeta}>{/* b75 (audit GR-3): roles come from this phone's own state (the creator key it holds; on the creator's phone, who it admitted) */}
+                      {m.role === 'creator' ? 'Creator' : m.role === 'pending' ? 'Waiting for your approval — no group keys yet' : m.leaving ? 'Says they are leaving — still gets new group keys until the group creator removes them' : 'Member'} · joined epoch {m.joinedEpoch}</Text>
+                    {group.isCreator && m.goneSince !== undefined ? (
+                      <Text style={styles.groupMemberMeta}>Not on the group's server list since {new Date(m.goneSince).toLocaleDateString()} — they may have left. They still get new keys until you remove them.</Text>
+                    ) : null}
                   </View>
                   {group.isCreator ? (
                     <TouchableOpacity
@@ -800,13 +838,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                         try { await group.onEvict({ veilId: m.veilId, ikPub: m.ikPub }); } catch (e) { setGroupErr('That did not work — please try again.'); console.log('[veil-error] group-evict:', String((e as Error).message ?? e)); }
                       }}
                     >
-                      <Text style={styles.evictBtnTxt}>{group.forum ? (evictArmed === m.veilId ? 'Block & remove posts?' : 'Block & remove posts') : (evictArmed === m.veilId ? 'Remove?' : 'Remove')}</Text>
+                      <Text style={styles.evictBtnTxt}>{evictArmed === m.veilId ? 'Remove?' : 'Remove'}</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
               ))}
             </ScrollView>
-            {group.isCreator && !group.forum ? (
+            {group.isCreator ? (
               <TouchableOpacity
                 style={styles.rotateBtn}
                 disabled={group.busy}
@@ -827,11 +865,93 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
 
       {historyNotice ? <Text style={styles.notice}>{historyNotice}</Text> : null}
 
-      {showVerifyCard && !myVerified ? (
+      {/* b76r2 (ZTE-5): a dead thread used to say "wait for the safety code" forever while the peer kept sending into it */}
+      {unrecoverable ? (
+        <View style={styles.claimRow}>
+          <View style={styles.inviteCard}>
+            <Text style={styles.inviteKicker}>This chat can't continue here</Text>
+            <Text style={styles.inviteSub}>This phone no longer has the keys for this chat (Nothing at rest or a wipe removed them), so nothing in it can be sent or read here. End it and start a new chat with the same person; ending it tells their phone too.</Text>
+            <View style={styles.inviteActions}>
+              <TouchableOpacity style={styles.inviteJoin} onPress={onEndSession}>
+                <Text style={styles.inviteJoinTxt}>End this chat</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      ) : null}
+
+      {/* b77m merge (audit VAR-07): the relay's word alone no longer ends a chat or deletes its history */}
+      {unavailable && !unrecoverable ? (
+        <View style={styles.claimRow}>
+          <View style={styles.inviteCard}>
+            <Text style={styles.inviteKicker}>{endedByPeer ? CHAT_ENDED_BY_PEER_TEXT : CHAT_UNAVAILABLE_TEXT}</Text>
+            <Text style={styles.inviteSub}>Nothing more can be sent or received in this chat. Its messages stay on this phone until you delete it. Start a new chat to keep talking to this person.</Text>
+            <View style={styles.inviteActions}>
+              {/* b77n (pre-audit INFO-5): the relay's word alone can be wrong — ask it again (never after the peer's END) */}
+              {onCheckAgain && !endedByPeer ? (
+                <TouchableOpacity style={styles.inviteJoin} accessibilityLabel="Check again" onPress={onCheckAgain}>
+                  <Text style={styles.inviteJoinTxt}>Check again</Text>
+                </TouchableOpacity>
+              ) : null}
+              <TouchableOpacity
+                style={styles.inviteJoin}
+                accessibilityLabel="Delete this chat"
+                onPress={() => { void (async () => {
+                  const ok = await ask({ title: 'Delete this chat?', message: 'Its messages are removed from this phone. This can’t be undone.', confirm: true, danger: true, submitLabel: 'Delete' });
+                  if (ok === true) onEndSession();
+                })(); }}
+              >
+                <Text style={styles.inviteJoinTxt}>Delete this chat</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      ) : null}
+
+      {/* b77r1 (audit A-5): a chat whose mailbox never finished opening used to wait (and queue) for ever */}
+      {setupFailed && !unrecoverable ? (
+        <View style={styles.claimRow}>
+          <View style={styles.inviteCard}>
+            <Text style={styles.inviteKicker}>This chat couldn't finish setting up</Text>
+            <Text style={styles.inviteSub}>The two phones never finished connecting this chat, so messages in it can't be delivered. Start a new chat with the same person and end this one.</Text>
+            <View style={styles.inviteActions}>
+              <TouchableOpacity style={styles.inviteJoin} onPress={onEndSession}>
+                <Text style={styles.inviteJoinTxt}>End this chat</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      ) : null}
+
+      {/* b71 (audit F-07): join requests — nobody gets into the group without the creator's tap */}
+      {group?.isCreator && group.pendingRequests?.length ? group.pendingRequests.map((r) => (
+        <View key={r.ikPub} style={styles.claimRow}>
+          <View style={styles.inviteCard}>
+            <Text style={styles.inviteKicker}>Wants to join</Text>
+            <Text style={styles.inviteName} numberOfLines={2}>{isolateName(r.label)}</Text>
+            <Text style={styles.inviteSub}>Vardum ID {r.veilId}</Text>
+            {r.contactLine ? <Text style={styles.inviteSub}>{r.contactLine}</Text> : null}
+            <Text style={styles.inviteSub}>They opened one of this group's invite links. Approve only someone you meant to invite. The keys rotate first, so they won't see earlier messages.</Text>
+            <View style={styles.inviteActions}>
+              <TouchableOpacity style={styles.inviteJoin} disabled={group.busy} onPress={async () => {
+                setGroupErr(null);
+                try { await group.onApproveRequest?.(r.ikPub); } catch (e) { setGroupErr('That did not work — please try again.'); console.log('[veil-error] group-approve:', String((e as Error).message ?? e)); }
+              }}>
+                <Text style={styles.inviteJoinTxt}>{group.busy ? 'Working…' : 'Approve'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.inviteDecline} disabled={group.busy} onPress={() => { void group.onDeclineRequest?.(r.ikPub).catch(() => undefined); }}>
+                <Text style={styles.inviteDeclineTxt}>Decline</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      )) : null}
+
+      {showVerifyCard && !myVerified && !unrecoverable ? (
         <View style={styles.vCard}>
           <View style={styles.vCardBody}>
-            <Text style={styles.vCardTitle}>Verify this session</Text>
-            <Text style={styles.vCardTxt}>Sending unlocks once you both compare the verification code out-of-band (call them or meet) and confirm it. This is a security check against interception on every chat path.</Text>
+            <Text style={styles.vCardTitle}>Check the safety code</Text>
+            <Text style={styles.vCardTxt}>Sending unlocks once you compare the safety code with the other person outside Vardum (call them or meet) and confirm it on this phone. It is the check that nobody is intercepting this chat.</Text>
             <View style={styles.vCardRow}>
               <TouchableOpacity style={styles.vCardBtn} onPress={() => { setCompareArmed(false); setVerifyFail(false); setVerifyPanel('ceremony'); }} accessibilityLabel="Verify fingerprints now">
                 <Text style={styles.vCardBtnTxt}>Verify fingerprints</Text>
@@ -881,18 +1001,40 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
         )}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Text style={styles.emptyTxt}>{status === 'pending' ? 'Your contact hasn\u2019t accepted yet — messages will flow once they do.' : 'No messages yet. Say hi.'}</Text>
+            <Text style={styles.emptyTxt}>{status === 'pending' && request ? 'Someone who isn\u2019t in your contacts wants to chat. The name they chose is not shown; check who it is before you accept.' : status === 'pending' ? 'Your contact hasn\u2019t accepted yet — messages will flow once they do.' : 'No messages yet. Say hi.'}</Text>
           </View>
         }
       />
 
+      {/* b71 (audit): a request from a Vardum ID that isn't pinned is answered here —
+          nothing is accepted, pinned or named until the user decides */}
+      {request && status === 'pending' ? (
+        <View style={styles.reqCard}>
+          <Text style={styles.reqTitle}>Accept this chat request?</Text>
+          <Text style={styles.reqTxt}>It comes from {isolateName(title)}, a Vardum ID that isn’t in your contacts. Accepting opens the chat; it doesn’t add them as a contact. You can check the safety code and pin them afterwards.</Text>
+          <View style={styles.reqRow}>
+            <TouchableOpacity style={styles.reqDecline} disabled={reqBusy} onPress={() => onDeclineRequest?.()} accessibilityLabel="Decline the chat request">
+              <Text style={styles.reqDeclineTxt}>Decline</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.reqAccept}
+              disabled={reqBusy}
+              onPress={() => { setReqBusy(true); void (onAcceptRequest?.() ?? Promise.resolve(false)).finally(() => setReqBusy(false)); }}
+              accessibilityLabel="Accept the chat request"
+            >
+              <Text style={styles.reqAcceptTxt}>{reqBusy ? 'Accepting…' : 'Accept'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : null}
+
       {/* composer */}
       <View style={[styles.composer, kbH > 0 && { paddingBottom: kbH + 12 }]}>
-        {verifyGate && status === 'active' && !busy ? (
+        {verifyGate && status === 'active' && !busy && !unrecoverable ? (
           /* b163 (web P1.2 parity): blocked-send state explains itself and the
            * ceremony stays reachable from the composer — no dead-end lock. */
           <View style={styles.verifyNotice}>
-            <Text style={styles.verifyNoticeTxt}>🔒 Sending unlocks once you both compare the verification code and confirm it.</Text>
+            <Text style={styles.verifyNoticeTxt}>🔒 Sending unlocks once you compare the safety code with the other person and confirm it on this phone.{!contact ? ' For a chat from an invite link, this is the only check that the server didn’t swap the keys.' /* b77u (audit 6 U-M15) */ : ''}</Text>
             <TouchableOpacity
               style={styles.verifyNowBtn}
               onPress={() => { setCompareArmed(false); setVerifyFail(false); setVerifyPanel(myVerified ? 'view' : 'ceremony'); }}
@@ -901,9 +1043,6 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
               <Text style={styles.verifyNowBtnTxt}>Verify now</Text>
             </TouchableOpacity>
           </View>
-        ) : null}
-        {loungeNote ? (
-          <Text style={styles.loungeNoteTxt}>{loungeNote}</Text>
         ) : null}
         {/* b199 UI redesign (owner, Oct 16): attach · message · mic/send. The
             mic becomes a send arrow as soon as there is text; while recording,
@@ -924,8 +1063,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
         ) : (
           <>
             <TouchableOpacity
-              style={[styles.roundBtn, styles.roundBtnGhost, (composerLocked || textOnly) && styles.roundBtnOff]}
-              disabled={composerLocked || !!textOnly}
+              style={[styles.roundBtn, styles.roundBtnGhost, composerLocked && styles.roundBtnOff]}
+              disabled={composerLocked}
               onPress={onAttach}
               accessibilityLabel="Attach a photo or video"
             >
@@ -933,7 +1072,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             </TouchableOpacity>
             <TextInput
               style={[styles.input, composerLocked && styles.inputLocked]}
-              placeholder={readOnly ? 'Read-only founder broadcast' : status === 'pending' ? 'Locked until your contact accepts' : verifyGate ? 'Locked until you both verify' : 'Message'}
+              placeholder={unrecoverable ? 'This chat has ended on this phone' : unavailable ? 'This chat is no longer available' : status === 'pending' ? (request ? 'Accept the request to chat' : 'Locked until your contact accepts') : verifyGate ? 'Locked until you confirm the safety code' : 'Message'}
               placeholderTextColor="#5E6464"
               value={draft}
               onChangeText={onDraftChange}
@@ -941,10 +1080,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
               // used to go non-editable while a send was in flight (busy), and
               // iOS drops the keyboard when the focused input is disabled.
               // Busy still blocks a second send via the button.
-              editable={!readOnly && status === 'active' && !verifyGate}
+              editable={status === 'active' && !verifyGate}
               multiline
+              // b70 (audit L-6): the Private keyboard setting. audit VAR-14: plus no content type / smart
+              // insert on iOS; what it can't stop is said in Settings (src/secret-entry.ts)
+              {...privateComposerProps(!!privateKeyboard)}
             />
-            {draft.trim() || textOnly ? (
+            {draft.trim() ? (
               <TouchableOpacity
                 style={[styles.roundBtn, (!composerLocked && draft.trim()) ? styles.roundBtnSend : [styles.roundBtnGhost, styles.roundBtnOff]]}
                 disabled={composerLocked || !draft.trim()}
@@ -1018,6 +1160,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
               </View>
               <Text style={styles.dlToggleTxt}>Allow recipient to save this {pendingPick.voiceSeconds ? 'voice note' : pendingPick.mime.startsWith('video/') ? 'video' : 'image'}</Text>
             </TouchableOpacity>
+            {/* audit VAR-42 (1f51): the recipient's own app enforces this — say so */}
+            <Text style={styles.pickMeta}>{SAVE_TOGGLE_NOTE}</Text>
             <View style={styles.pickBtns}>
               <TouchableOpacity style={styles.pickCancel} onPress={onCancelPick}>
                 <Text style={styles.pickCancelTxt}>Cancel</Text>
@@ -1032,7 +1176,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
 
       {/* lightbox — full-screen media view */}
       {/* (b66) VEIL-styled ✕ sheet — End is a real red destructive button */}
-      <Modal visible={sheet} transparent animationType="slide" onRequestClose={() => setSheet(false)}>
+      <SecureOverlay visible={sheet} onRequestClose={() => setSheet(false)}>
         <TouchableOpacity style={styles.sheetBackdrop} activeOpacity={1} onPress={() => setSheet(false)}>
           <TouchableOpacity style={styles.sheetPanel} activeOpacity={1} onPress={() => undefined}>
             {canRename && onRenameThread ? (
@@ -1055,10 +1199,18 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             ) : null}
             <TouchableOpacity style={styles.sheetRowDanger} onPress={() => { setSheet(false); onEndSession(); }}>
               {group ? (
-                <>
-                  <Text style={styles.sheetRowDangerTxt}>Delete this group thread</Text>
-                  <Text style={styles.sheetRowDangerSub}>Removes the thread from this device</Text>
-                </>
+                /* audit VAR-24: the words match what happens (groupDeletePlan in App.tsx) */
+                group.isCreator ? (
+                  <>
+                    <Text style={styles.sheetRowDangerTxt}>Delete this group thread</Text>
+                    <Text style={styles.sheetRowDangerSub}>From this phone only — the group goes on for the others</Text>
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.sheetRowDangerTxt}>Leave this group</Text>
+                    <Text style={styles.sheetRowDangerSub}>Tells the group you left and deletes the thread from this phone</Text>
+                  </>
+                )
               ) : (
                 <>
                   <Text style={styles.sheetRowDangerTxt}>End this session</Text>
@@ -1066,25 +1218,36 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                 </>
               )}
             </TouchableOpacity>
+            {group && onEndGroupForAll ? (
+              <TouchableOpacity style={styles.sheetRowDanger} onPress={async () => {
+                setSheet(false);
+                const ok = await ask({ title: 'End this group for everyone?', message: 'The group closes on every member’s phone and can’t be reopened. Their copies of earlier messages stay on their phones.', confirm: true, danger: true, submitLabel: 'End for everyone' });
+                if (ok) onEndGroupForAll();
+              }}>
+                <Text style={styles.sheetRowDangerTxt}>End group for everyone</Text>
+                <Text style={styles.sheetRowDangerSub}>Closes the group on every member’s phone — permanently</Text>
+              </TouchableOpacity>
+            ) : null}
             <TouchableOpacity style={styles.sheetRowCancel} onPress={() => setSheet(false)}>
               <Text style={styles.sheetCancelTxt}>Cancel</Text>
             </TouchableOpacity>
           </TouchableOpacity>
         </TouchableOpacity>
-      </Modal>
+      </SecureOverlay>
       {/* b126 verification panel — fingerprint viewable pre AND post verification;
           "Mark verified" only unlocks after an explicit out-of-band comparison
           confirmation. Vardum palette (#15151B card, white primary). */}
-      <Modal visible={!!verifyPanel} transparent animationType="fade" onRequestClose={() => setVerifyPanel(null)}>
+      <SecureOverlay visible={!!verifyPanel} onRequestClose={() => setVerifyPanel(null)}>
         <TouchableOpacity style={styles.rnBackdrop} activeOpacity={1} onPress={() => setVerifyPanel(null)}>
           <TouchableOpacity style={styles.rnCard} activeOpacity={1} onPress={() => undefined}>
             {verifyPanel === 'ceremony' ? (
               <>
                 <Text style={styles.rnTitle}>Verify this session</Text>
                 <Text style={styles.fpBox} selectable>
-                  {sessionFingerprint ?? 'No safety code yet. It appears here once the other phone has opened Vardum and joined this chat. Keep Vardum open on both phones and wait a few seconds; starting another new chat resets this.'}
+                  {sessionFingerprint ?? (unrecoverable ? 'There is no safety code: this phone no longer has the keys for this chat. End it and start a new one.' : 'No safety code yet. It appears here once the other phone has opened Vardum and joined this chat. Keep Vardum open on both phones and wait a few seconds; starting another new chat resets this.')}
                 </Text>
                 <Text style={styles.rnBody}>Compare it with your peer out-of-band — read it to them on a call, or side by side in person. Only continue if every group of characters matches exactly.</Text>
+                {!group && !contact ? <Text style={styles.rnBody}>{UNPINNED_KEYS_NOTE /* b77u (audit 6 U-M15) */}</Text> : null}
                 <TouchableOpacity
                   style={[styles.fpStepBtn, compareArmed && styles.fpStepBtnOn]}
                   onPress={() => setCompareArmed(true)}
@@ -1106,7 +1269,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                     disabled={!compareArmed || !sessionFingerprint}
                     onPress={() => {
                       setVerifyFail(false);
-                      void onVerifySession().then((ok) => { if (!ok) setVerifyFail(true); else setVerifyPanel(null); });
+                      void onVerifySession(sessionFingerprint ?? '').then((ok) => { if (!ok) setVerifyFail(true); else setVerifyPanel(null); });
                     }}
                   >
                     <Text style={styles.rnBtnTealTxt}>{verifyFail ? 'Retry' : 'Mark verified'}</Text>
@@ -1120,7 +1283,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                   {sessionFingerprint ?? '(fingerprint unavailable on this device)'}
                 </Text>
                 <Text style={styles.fpStatus}>
-                  You verified this session ✓{'\n'}{peerVerified ? 'Peer verified this session ✓' : 'Peer has not verified yet'}
+                  {/* b77t (audit 5 M-F): one-sided; this phone can't know whether the other person has checked */}
+                  {CONFIRMED_PANEL_TEXT}
                 </Text>
                 {peerVeilId ? (
                   peerPinned ? (
@@ -1140,16 +1304,16 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             ) : null}
           </TouchableOpacity>
         </TouchableOpacity>
-      </Modal>
+      </SecureOverlay>
       {/* b123: rename modal — same VEIL modal pattern as the Contacts nickname */}
-      <Modal visible={renameOpen} transparent animationType="fade" onRequestClose={() => setRenameOpen(false)}>
+      <SecureOverlay visible={renameOpen} onRequestClose={() => setRenameOpen(false)}>
         <TouchableOpacity style={styles.rnBackdrop} activeOpacity={1} onPress={() => setRenameOpen(false)}>
           <TouchableOpacity style={styles.rnCard} activeOpacity={1} onPress={() => undefined}>
             <Text style={styles.rnTitle}>Rename this thread</Text>
             <Text style={styles.rnBody}>Stored on this device only. Never transmitted, never synced, never on the server.</Text>
             <TextInput
               style={styles.rnInput}
-              placeholder="e.g. Founder Tester Lounge"
+              placeholder="e.g. Book club"
               placeholderTextColor="#5E6464"
               value={renameInput}
               onChangeText={setRenameInput}
@@ -1168,8 +1332,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             </View>
           </TouchableOpacity>
         </TouchableOpacity>
-      </Modal>
-      <Modal visible={!!videoFS} animationType="fade" onRequestClose={() => setVideoFS(null)} supportedOrientations={['portrait', 'landscape', 'landscape-left', 'landscape-right']}>
+      </SecureOverlay>
+      <SecureOverlay visible={!!videoFS} transparent={false} onRequestClose={() => setVideoFS(null)}>
         {videoFS ? (
           <View style={styles.videoFSBg}>
             <Video
@@ -1186,13 +1350,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             <Text style={styles.videoFSHint}>{videoFS.name} — decrypted on this phone</Text>
           </View>
         ) : null}
-      </Modal>
-      <Modal visible={!!lightbox} transparent animationType="fade" onRequestClose={() => setLightbox(null)}>
+      </SecureOverlay>
+      <SecureOverlay visible={!!lightbox} onRequestClose={() => setLightbox(null)}>
         <TouchableOpacity style={styles.lightbox} activeOpacity={1} onPress={() => setLightbox(null)}>
           {lightbox ? <Image source={{ uri: lightbox.src }} style={styles.lightboxImg} resizeMode="contain" /> : null}
-          <Text style={styles.lightboxHint}>{lightbox?.name ?? ''} — tap anywhere to close</Text>
+          <Text style={styles.lightboxHint} numberOfLines={1}>{mediaDisplayName(lightbox?.name)} — tap anywhere to close</Text>{/* b77q (audit 3 AQ-2) */}
         </TouchableOpacity>
-      </Modal>
+      </SecureOverlay>
       {chooserNode}
       {promptNode}
     </View>
@@ -1200,6 +1364,14 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
 }
 
 const styles = StyleSheet.create({
+  reqCard: { marginHorizontal: 12, marginBottom: 8, padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#3A3A44', backgroundColor: '#15151B' },
+  reqTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '700', marginBottom: 6 },
+  reqTxt: { color: '#C9CFCE', fontSize: 13, lineHeight: 18, marginBottom: 12 },
+  reqRow: { flexDirection: 'row', justifyContent: 'flex-end' },
+  reqDecline: { paddingVertical: 10, paddingHorizontal: 18, borderRadius: 10, borderWidth: 1, borderColor: '#24242D', marginRight: 10 },
+  reqDeclineTxt: { color: '#C9CFCE', fontSize: 14, fontWeight: '600' },
+  reqAccept: { paddingVertical: 10, paddingHorizontal: 22, borderRadius: 10, backgroundColor: '#FFFFFF' },
+  reqAcceptTxt: { color: '#0B0B0F', fontSize: 14, fontWeight: '800' },
   fpFailTxt: { color: '#e8896b', fontSize: 13, lineHeight: 18, marginBottom: 10 },
   fill: { flex: 1, backgroundColor: '#0B0B0F' },
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingBottom: 10, paddingTop: 48, borderBottomWidth: 1, borderBottomColor: '#24242D', backgroundColor: '#0B0B0F' },
@@ -1211,6 +1383,7 @@ const styles = StyleSheet.create({
   callGlyph: { color: '#FFFFFF', fontSize: 20, lineHeight: 24 },
   // b62 groups
   senderLbl: { color: '#FFFFFF', fontSize: 11, marginBottom: 2 },
+  creatorBadge: { color: '#FFD479', fontSize: 9, fontWeight: '700', letterSpacing: 0.5 }, // b75 (audit GR-4)
   groupOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(11,11,15,0.86)', justifyContent: 'center', padding: 18, zIndex: 40 },
   groupPanel: { backgroundColor: '#0B0B0F', borderColor: '#24242D', borderWidth: 1, borderRadius: 14, padding: 16, maxHeight: '72%' },
   groupPanelHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
@@ -1258,6 +1431,7 @@ const styles = StyleSheet.create({
   // b123: read-receipt tick appended to my read bubbles' timestamps
   // Vardum: inherits the timestamp colour so it reads on the white sent bubble and on dark media bubbles
   readTick: { fontWeight: '700' },
+  queuedTick: { fontStyle: 'italic' },
   // b123: rename-thread modal (Vardum palette: #15151B card, white primary)
   rnBackdrop: { flex: 1, backgroundColor: 'rgba(11,11,15,0.8)', justifyContent: 'center', alignItems: 'center', padding: 28 },
   rnCard: { width: '100%', backgroundColor: '#15151B', borderRadius: 16, borderWidth: 1, borderColor: '#24242D', padding: 18 },
@@ -1305,6 +1479,7 @@ const styles = StyleSheet.create({
   inviteJoinTxt: { color: '#0B0B0F', fontWeight: '800', fontSize: 14 },
   inviteDecline: { borderWidth: 1, borderColor: '#24242D', borderRadius: 10, paddingVertical: 9, paddingHorizontal: 16 },
   inviteDeclineTxt: { color: '#8E9696', fontWeight: '600', fontSize: 14 },
+  claimRow: { paddingHorizontal: 12, paddingTop: 8, alignItems: 'center' }, // b71 (audit F-07): join request card
   bubble: { maxWidth: '78%', borderRadius: 16, paddingHorizontal: 12, paddingVertical: 8 },
   // Vardum: media bubbles stay dark (white sent bubble would hide the white audio/play controls)
   mediaBubble: { padding: 6, backgroundColor: '#24242D' },
@@ -1409,14 +1584,4 @@ const styles = StyleSheet.create({
   videoFSClose: { position: 'absolute', top: 54, right: 20, width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(11,11,15,0.55)', alignItems: 'center', justifyContent: 'center' },
   videoFSCloseTxt: { color: '#FFFFFF', fontSize: 20, lineHeight: 22 },
   videoFSHint: { color: '#8E9696', fontSize: 11, textAlign: 'center', paddingVertical: 10 },
-
-  // b187: lounge read-only notice
-  loungeNoteTxt: {
-    flexBasis: '100%',
-    width: '100%',
-    color: '#FFFFFF',
-    fontSize: 12,
-    textAlign: 'center',
-    paddingBottom: 6,
-  },
 });

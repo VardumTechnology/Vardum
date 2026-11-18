@@ -28,23 +28,38 @@ export interface VeilSettings {
   selfDestructArmedAt: number;
   /** Read receipts */
   readReceipts: boolean;
-  /** Device-local nickname (never transmitted/synced/server-stored) */
+  /** Your nickname: signed and shown to members of groups you join (inside the group's
+   *  encryption); never sent to or stored by the relay */
   nickname: string;
   /** checkup completed */
   setupDone: boolean;
   /** (b199) a NEW sign-up has not finished the required onboarding
    *  (intro → checkup → passcode) yet — boot resumes it instead of the app */
   onboardingPending: boolean;
+  /** b77f (audit ZTE77-4): a phrase restore left this phone with no app lock and the required
+   *  "Set your password" step has not finished yet — boot resumes it instead of the app */
+  restorePasswordPending: boolean;
+  /** b77f2 (audit F-1): the post-restore "Set your password" step (onboarding mode 'passwordOnly')
+   *  was finished once — like setupDone, it keeps the boot's no-lock guard from asking again
+   *  (a lock removed later in Settings stays removed) */
+  passwordStepDone: boolean;
   /** (b139 funnel fix) first REAL relay session opened — the "Secure your VEIL"
    *  prompt waits until after this, never before (onboarding-funnel-fix-spec) */
   firstSessionDone: boolean;
   /** (b139 funnel fix) the local "Getting started" welcome note is hidden */
   welcomeDismissed: boolean;
-  /** (b139 attribution) the one-tap "How did you hear about VEIL?" prompt ran */
+  /** (b139) the old "How did you hear about Vardum?" prompt ran — b71: the prompt is gone; kept so old settings still load */
   attributionDone: boolean;
   /** Redact screenshots & screen recording — while VEIL is open, captures of
    *  the screen come out redacted instead of showing conversations (b61). */
   screenshotShield: boolean;
+  /** b70 (audit L-6): the composer turns off autocorrect, suggestions and
+   *  keyboard learning, so the keyboard keeps no record of what is typed */
+  privateKeyboard: boolean;
+  /** b71 (audit): send one-time usage milestones to Vardum (opt-in, off by default) */
+  usageStats: boolean;
+  /** b73 (audit V-14): erase Vardum after 10 wrong app-lock passwords in a row (opt-in) */
+  wipeAfterFails: boolean;
 }
 
 /** Auto-lock is NOT a dial: a fixed 1-minute inactivity rule, always on. */
@@ -77,14 +92,21 @@ const FALLBACK: VeilSettings = {
   holdUntilUnlock: false,
   selfDestruct: false,
   selfDestructArmedAt: 0,
-  readReceipts: true,
+  // b77t (audit 5 C-04): off until the user turns them on (the policy's words). It was true, so a 24-word
+  // restore (which skips the checkup that asks) sent read receipts without asking
+  readReceipts: false,
   nickname: '',
   setupDone: false,
   onboardingPending: false,
+  restorePasswordPending: false,
+  passwordStepDone: false,
   firstSessionDone: false,
   welcomeDismissed: false,
   attributionDone: false,
   screenshotShield: true,
+  privateKeyboard: true,
+  usageStats: false,
+  wipeAfterFails: false,
 };
 
 /** Exact dial option values (handoff §0 table). 0 = Off. */
@@ -99,7 +121,7 @@ export const EXPIRY_OPTIONS = [
   { label: '1 hour', value: 3600 }, { label: '6 hours', value: 21600 },
   { label: '12 hours', value: 43200 }, { label: '24 hours', value: 86400 },
   { label: '36 hours', value: 129600 }, { label: '48 hours', value: 172800 },
-  // b198: the 30-day tier — the Founding Tester Forum's backlog lifetime
+  // b198: the 30-day tier — the longest backlog lifetime
   // (messages persist 30 days, no burn, then the sweeper purges).
   { label: '30 days', value: 2592000 }, { label: 'Off', value: 0 },
 ];
@@ -117,12 +139,29 @@ export class SettingsStore {
 
   constructor(private get: Getter, private set: Setter) {}
 
+  /** b75 round 2 (audit D10): a record that can't be read (altered, failed its seal check,
+   *  unparsable) no longer reads as the defaults (self-destruct off, erase-after-10 off,
+   *  history on): it reads as `protectiveSettings`. Only a MISSING record gives the defaults
+   *  (a new install, or after a wipe); App.tsx treats a missing record on a phone that still
+   *  holds an identity or a lock as tampering too. */
   async load(): Promise<VeilSettings> {
+    return (await this.loadChecked()).settings;
+  }
+
+  /** b75 round 2 (D10): the settings and whether the record was there and readable */
+  async loadChecked(): Promise<{ settings: VeilSettings; state: 'ok' | 'missing' | 'unreadable' }> {
+    let raw: string | null;
+    try { raw = await this.get(SettingsStore.KEY); } catch { return { settings: protectiveSettings(), state: 'unreadable' }; }
+    if (raw === null || raw === undefined) return { settings: { ...FALLBACK }, state: 'missing' };
+    // b75 round 3 (audit DV-2): an EMPTY record is never written: it is damage, not "no
+    // settings" (an empty value used to stand in for a missing record, the defaults)
+    if (raw === '') return { settings: protectiveSettings(), state: 'unreadable' };
     try {
-      const raw = await this.get(SettingsStore.KEY);
-      return raw ? this.merge(JSON.parse(raw)) : { ...FALLBACK };
+      const v = JSON.parse(raw) as unknown;
+      if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('not an object');
+      return { settings: this.merge(v as Partial<VeilSettings>), state: 'ok' };
     } catch {
-      return { ...FALLBACK };
+      return { settings: protectiveSettings(), state: 'unreadable' };
     }
   }
 
@@ -144,9 +183,31 @@ export function mergeSettings(partial: Partial<VeilSettings>): VeilSettings {
     if (out.storageMode !== 'device' && out.storageMode !== 'hardware' && out.storageMode !== 'memory') out.storageMode = 'device';
     // Nothing-at-Rest forces local history off
     if (out.storageMode === 'memory') out.localHistory = false;
+    out.usageStats = out.usageStats === true; // b71 (audit): only an explicit yes counts
+    out.wipeAfterFails = out.wipeAfterFails === true; // b73 (audit V-14)
     return out;
 }
 
+
+/**
+ * b75 round 2 (audit D10): what an unreadable settings record reads as — every protection
+ * on: the self-destruct countdown armed from now, the erase after 10 wrong passwords,
+ * history off, delivery held while the phone is locked. `base` keeps the other dials
+ * (e.g. the storage mode the key store itself records).
+ */
+export function protectiveSettings(base: Partial<VeilSettings> = {}, now = Date.now()): VeilSettings {
+  return mergeSettings({
+    ...base,
+    selfDestruct: true,
+    selfDestructArmedAt: now,
+    wipeAfterFails: true,
+    localHistory: false,
+    holdUntilUnlock: true,
+    screenshotShield: true,
+    privateKeyboard: true,
+    usageStats: false,
+  });
+}
 
 /** Per-envelope TTL (web Kh semantics, 36 h hard cap) — used by the send path. */
 export function messageTtlSeconds(

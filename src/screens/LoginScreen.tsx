@@ -23,7 +23,9 @@ export function LoginScreen({ busy, error, info, onLogin, onForgotPassword, onSi
   const [password, setPassword] = useState('');
   const [mode, setMode] = useState<'signin' | 'forgot' | 'signup'>('signin');
   const forgot = mode === 'forgot';
-  const canSubmit = !busy && (forgot || (!!email && !!password));
+  // b71 (audit): new email accounts need 12+ characters (the relay enforces it too)
+  const tooShort = mode === 'signup' && password.length > 0 && password.length < 12;
+  const canSubmit = !busy && (forgot || (!!email && !!password && !tooShort));
   const submit = () => {
     if (!canSubmit) return;
     // Batch G (round-5 review R5-3-12): no email is ever verified, so there is no reset
@@ -53,7 +55,7 @@ export function LoginScreen({ busy, error, info, onLogin, onForgotPassword, onSi
           </Text>
           <Text style={styles.disclaimerBold}>Your email is not your identity.</Text>
           <View style={styles.disclaimerRow}><Text style={styles.disclaimerDot}>•</Text><Text style={styles.disclaimerItem}>Your Vardum ID, your identity keys and your 24-word phrase are created on this device. The server links your Vardum ID to this login, but never sees your keys or your phrase.</Text></View>
-          <View style={styles.disclaimerRow}><Text style={styles.disclaimerDot}>•</Text><Text style={styles.disclaimerItem}>Your messages, contacts, notes and vaults are end-to-end encrypted. This address is only the login anchor — it is never connected to your message, contact, note or vault contents.</Text></View>
+          <View style={styles.disclaimerRow}><Text style={styles.disclaimerDot}>•</Text><Text style={styles.disclaimerItem}>Your messages are end-to-end encrypted; notes and vaults are encrypted on this phone before they are uploaded; your contact list is kept on this phone. Adding a contact goes with your login; the checks of your contacts’ keys (every few hours, and when you open their chat) go without it, though the server could still guess from your network address and timing. This address is only the login anchor — it is never connected to your message, note or vault contents.</Text></View>
           <View style={styles.disclaimerRow}><Text style={styles.disclaimerDot}>•</Text><Text style={styles.disclaimerItem}>Messages are end-to-end encrypted: the relay passes them on but can't read them.</Text></View>
           <Text style={styles.disclaimerBody}>
             A forgotten password cannot be recovered by email — your 24-word phrase is the ONLY way back into your identity. Keep it safe. Once you are in, the email plays no part in how Vardum identifies you, finds you, or talks to your contacts.
@@ -103,6 +105,7 @@ export function LoginScreen({ busy, error, info, onLogin, onForgotPassword, onSi
             </>
           )}
 
+          {tooShort ? <Text style={styles.info}>Use at least 12 characters.</Text> : null}
           {error ? <Text style={styles.error}>{error}</Text> : null}
           {info ? <Text style={styles.info}>{info}</Text> : null}
 
@@ -110,8 +113,8 @@ export function LoginScreen({ busy, error, info, onLogin, onForgotPassword, onSi
             <ActivityIndicator color="#FFFFFF" style={styles.busy} />
           ) : (
             <TouchableOpacity
-              style={[styles.cta, !forgot && (!email || !password) && styles.ctaDisabled]}
-              disabled={!forgot && (!email || !password)}
+              style={[styles.cta, !forgot && (!email || !password || tooShort) && styles.ctaDisabled]}
+              disabled={!forgot && (!email || !password || tooShort)}
               onPress={submit}
             >
               <Text style={styles.ctaText}>{forgot ? 'Back to sign in' : mode === 'signup' ? 'Create account' : 'Sign in'}</Text>

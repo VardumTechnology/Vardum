@@ -20,31 +20,41 @@
  *
  * The typed value lives only in React state (the caller's useState, exactly as
  * it did with TextInput) — never in a native text view, the pasteboard or the OS.
+ *
+ * audit VAR-23 (b77m): nor in accessibility events. Character keys used to be labelled with their
+ * character (an accessibility service — which FLAG_SECURE does not stop — was told every key
+ * pressed), and an unmasked field read its whole value out. Now every character key is announced
+ * only as "Key" (its glyph is hidden from accessibility), the control keys keep their names (Shift,
+ * Delete, Space, Done…), and the field reports a count, never the text. Trade-off: a screen-reader
+ * user can't tell which character a key types; such users need the phone keyboard instead.
+ *
+ * b77n (owner decision, 30 Oct): the 24-word phrase and the lock / decoy / duress codes are typed
+ * here too (not only the sign-in password). The layouts live in src/keypad-layout.ts: the password
+ * pages carry every printable ASCII character. The phrase layout is lowercase QWERTY + space, with
+ * a strip of BIP39 word suggestions computed on the phone from the app's own wordlist
+ * (phraseSuggestions — nothing sent or stored; a suggestion is announced only as "Suggestion",
+ * never the word) and, when the screen supplies onPaste, a Paste key (the pasteboard is read and
+ * cleared by the screen through its guard module — never in this file).
+ * Trade-off kept from VAR-23: a screen-reader user can't hear which key is pressed; where an
+ * existing code is entered the screen offers the phone keyboard instead.
+ *
+ * b77q (audit 3 AP-6): the key positions told an accessibility service what "Key" was pressed.
+ * Without a screen reader the key grid is now hidden from accessibility altogether, and while any
+ * accessibility service is on the character keys are shuffled each time the keypad opens
+ * (keypadA11yPlan / shufflePage in src/keypad-layout.ts, where the residual risk is written down).
+ * Trade-off: with a service on (TalkBack included) the layout is not QWERTY and moves every entry.
  */
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, Keyboard, type StyleProp, type ViewStyle, type TextStyle } from 'react-native';
+import { View, Text, Pressable, StyleSheet, Keyboard, AccessibilityInfo, Platform, type StyleProp, type ViewStyle, type TextStyle } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { keyA11yLabel, fieldA11yValue, phraseSuggestions, applyPhraseSuggestion, normalizePhraseTyping } from '../secret-entry'; // b77m (audit VAR-23); b77n
+import { LETTERS, NUMBERS, SYMBOLS } from '../keypad-layout'; // b77n: full printable ASCII on the password pages
+import { keypadA11yPlan, shufflePage } from '../keypad-layout'; // b77q (audit 3 AP-6)
 
 /** 'password': full keyboard, masked. 'phrase': lowercase letters + space only (24-word recovery phrase). */
 export type KeypadVariant = 'password' | 'phrase';
 type Layer = 'letters' | 'numbers' | 'symbols';
 type Shift = 'off' | 'once' | 'lock';
-
-const LETTERS = [
-  ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p'],
-  ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l'],
-  ['z', 'x', 'c', 'v', 'b', 'n', 'm'],
-];
-const NUMBERS = [
-  ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
-  ['-', '/', ':', ';', '(', ')', '$', '&', '@', '"'],
-  ['.', ',', '?', '!', "'"],
-];
-const SYMBOLS = [
-  ['[', ']', '{', '}', '#', '%', '^', '*', '+', '='],
-  ['_', '\\', '|', '~', '<', '>', '€', '£', '¥', '`'],
-  ['.', ',', '?', '!', "'"],
-];
 
 interface Binding {
   value: string;
@@ -56,6 +66,8 @@ interface Binding {
   disabled?: boolean;
   doneLabel?: string;
   initialLayer?: Layer;
+  /** b77n: the phrase keypad's Paste key (shown only when set) */
+  onPaste?: () => void;
 }
 
 interface HostApi {
@@ -69,6 +81,20 @@ const HostCtx = createContext<HostApi | null>(null);
 
 /** Array.from counts a symbol like € (one code point) as one character */
 const chars = (v: string) => Array.from(v);
+
+/** b77q (audit 3 AP-6): screen reader / any accessibility service, read once at load and kept
+ *  current, so a keypad opens with the right plan (no layout jump after it appears) */
+let a11yNow = { screenReader: false, anyService: false };
+try {
+  const upd = (p: Partial<typeof a11yNow>) => { a11yNow = { ...a11yNow, ...p }; };
+  AccessibilityInfo.isScreenReaderEnabled().then((v) => upd({ screenReader: !!v }), () => undefined);
+  AccessibilityInfo.addEventListener('screenReaderChanged', (v: boolean) => upd({ screenReader: !!v }));
+  if (Platform.OS === 'android') {
+    AccessibilityInfo.isAccessibilityServiceEnabled().then((v) => upd({ anyService: !!v }), () => undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (AccessibilityInfo.addEventListener as any)('accessibilityServiceChanged', (v: boolean) => upd({ anyService: !!v }));
+  }
+} catch { /* not available: the grid stays hidden, unshuffled */ }
 
 /* ------------------------------- keypad -------------------------------- */
 
@@ -104,10 +130,36 @@ export function SecureKeypad({ binding, onClose }: { binding: React.MutableRefOb
   };
 
   const phrase = b.variant === 'phrase';
-  const rows = layer === 'letters' ? LETTERS : layer === 'numbers' ? NUMBERS : SYMBOLS;
+  // b77q (audit 3 AP-6): fixed for this opening of the keypad (a fresh deal next time)
+  const plan = useMemo(() => keypadA11yPlan(a11yNow), []);
+  const pages = useMemo(() => (plan.shuffle
+    ? { letters: shufflePage(LETTERS), numbers: shufflePage(NUMBERS), symbols: shufflePage(SYMBOLS) }
+    : { letters: LETTERS, numbers: NUMBERS, symbols: SYMBOLS }), [plan]);
+  const rows = phrase || layer === 'letters' ? pages.letters : layer === 'numbers' ? pages.numbers : pages.symbols;
+  // b77n: BIP39 suggestions for the word being typed (local wordlist; redrawn as the value changes)
+  const suggestions = phrase ? phraseSuggestions(b.value, 4) : [];
+  const suggest = (w: string) => {
+    const cur = binding.current;
+    if (cur.disabled) return;
+    cur.onChange(applyPhraseSuggestion(cur.value, w));
+  };
+  const paste = () => { const cur = binding.current; if (!cur.disabled) cur.onPaste?.(); };
 
   return (
-    <View style={[s.pad, b.disabled && s.padOff]} accessibilityLabel="Vardum keyboard">
+    <View style={[s.pad, b.disabled && s.padOff]} accessibilityLabel="Vardum keyboard"
+      importantForAccessibility={plan.hideGrid ? 'no-hide-descendants' : 'auto'} accessibilityElementsHidden={plan.hideGrid}>
+      {phrase ? (
+        <View style={[s.row, s.suggestRow]}>
+          {suggestions.map((w) => (
+            <Pressable key={w} onPress={() => suggest(w)} accessibilityRole="button"
+              accessibilityLabel="Suggestion" /* audit VAR-23: never the word */
+              style={({ pressed }) => [s.suggest, pressed && s.keyPressed]}>
+              <Text style={s.suggestTxt} allowFontScaling={false} numberOfLines={1}
+                importantForAccessibility="no" accessibilityElementsHidden>{w}</Text>
+            </Pressable>
+          ))}
+        </View>
+      ) : null}
       {rows.map((row, ri) => (
         <View key={ri} style={s.row}>
           {ri === 2 && !phrase ? (
@@ -122,12 +174,12 @@ export function SecureKeypad({ binding, onClose }: { binding: React.MutableRefOb
           ) : null}
           {ri === 1 && layer === 'letters' ? <View style={s.half} /> : null}
           {row.map((ch) => (
-            <Key key={ch} label={layer === 'letters' && shift !== 'off' ? ch.toUpperCase() : ch}
+            <Key key={ch} fast label={layer === 'letters' && shift !== 'off' ? ch.toUpperCase() : ch}
               onPress={() => (layer === 'letters' ? letter(ch) : type(ch))} />
           ))}
           {ri === 1 && layer === 'letters' ? <View style={s.half} /> : null}
           {ri === 2 ? (
-            <Key wide special a11y="Delete" icon="backspace-outline" onPress={backspace}
+            <Key wide special fast a11y="Delete" icon="backspace-outline" onPress={backspace}
               onLongPress={() => { stopRepeat(); repeat.current = setInterval(backspace, 90); }} onPressOut={stopRepeat} />
           ) : null}
         </View>
@@ -137,14 +189,22 @@ export function SecureKeypad({ binding, onClose }: { binding: React.MutableRefOb
           <Key wide special label={layer === 'letters' ? '123' : 'ABC'} a11y={layer === 'letters' ? 'Numbers and symbols' : 'Letters'}
             onPress={() => { setLayer(layer === 'letters' ? 'numbers' : 'letters'); setShift('off'); }} />
         ) : null}
-        <Key space label="space" a11y="Space" onPress={() => type(' ')} />
-        <Key done label={b.doneLabel ?? 'Done'} onPress={done} />
+        {phrase && b.onPaste ? <Key wide special label="Paste" a11y="Paste" onPress={paste} /> : null}
+        <Key space fast label="space" a11y="Space" onPress={() => type(' ')} />
+        <Key done label={b.doneLabel ?? 'Done'} a11y={b.doneLabel ?? 'Done'} onPress={done} />
       </View>
     </View>
   );
 }
 
-function Key({ label, icon, a11y, onPress, onLongPress, onPressOut, wide, special, space, done, on }: {
+/** b77 rollout (owner, 5 Nov: "not very sensitive like a normal iOS one"): typing keys fire on touch-DOWN.
+ *  On release, a fast typist's next finger took the touch from the key still held, which then never fired
+ *  (a lost letter), and a finger that slid a little cancelled the key. hitSlop also covers the 6 px / 8 px
+ *  gaps between keys, so a tap on a gap goes to the nearest key instead of nowhere. With a screen reader
+ *  on, keys stay on release (VoiceOver / TalkBack activate a key through onPress only). */
+const KEY_SLOP = { top: 4, bottom: 4, left: 3, right: 3 } as const;
+
+function Key({ label, icon, a11y, onPress, onLongPress, onPressOut, wide, special, space, done, on, fast }: {
   label?: string;
   icon?: React.ComponentProps<typeof Ionicons>['name'];
   a11y?: string;
@@ -152,15 +212,21 @@ function Key({ label, icon, a11y, onPress, onLongPress, onPressOut, wide, specia
   onLongPress?: () => void;
   onPressOut?: () => void;
   wide?: boolean; special?: boolean; space?: boolean; done?: boolean; on?: boolean;
+  /** types on touch-down (character, space and delete keys) */
+  fast?: boolean;
 }) {
+  const onDown = fast && !a11yNow.screenReader;
   return (
     <Pressable
-      onPress={onPress}
+      onPressIn={onDown ? onPress : undefined}
+      onPress={onDown ? undefined : onPress}
       onLongPress={onLongPress}
       onPressOut={onPressOut}
       delayLongPress={350}
+      hitSlop={KEY_SLOP}
+      pressRetentionOffset={KEY_SLOP}
       accessibilityRole="keyboardkey"
-      accessibilityLabel={a11y ?? label}
+      accessibilityLabel={keyA11yLabel(label, a11y) /* audit VAR-23: never the character */}
       style={({ pressed }) => [
         s.key, wide && s.keyWide, space && s.keySpace,
         special && s.keySpecial, done && s.keyDone, on && s.keyOn,
@@ -168,7 +234,8 @@ function Key({ label, icon, a11y, onPress, onLongPress, onPressOut, wide, specia
       ]}
     >
       {icon ? <Ionicons name={icon} size={22} color="#FFFFFF" /> : (
-        <Text style={[s.keyTxt, (wide || space || done) && s.keyTxtSmall, done && s.keyTxtDone, on && s.keyTxtOn]} allowFontScaling={false}>{label}</Text>
+        <Text style={[s.keyTxt, (wide || space || done) && s.keyTxtSmall, done && s.keyTxtDone, on && s.keyTxtOn]} allowFontScaling={false}
+          importantForAccessibility="no" accessibilityElementsHidden>{label}</Text>
       )}
     </Pressable>
   );
@@ -235,13 +302,15 @@ export interface SecureInputProps {
   placeholderTextColor?: string;
   /** drawn before the text, e.g. a lock icon */
   left?: React.ReactNode;
+  /** b77n: phrase fields — the keypad shows a Paste key that calls this */
+  onPaste?: () => void;
   accessibilityLabel?: string;
 }
 
 export function SecureInput({
   value, onChangeText, placeholder, variant = 'password', masked = variant === 'password',
   maxLength = 1024, autoFocus, editable = true, onSubmit, stayOpen, doneLabel, numeric, multiline,
-  style, focusedStyle, textStyle, placeholderTextColor = '#5E6464', left, accessibilityLabel,
+  style, focusedStyle, textStyle, placeholderTextColor = '#5E6464', left, accessibilityLabel, onPaste,
 }: SecureInputProps) {
   const host = useContext(HostCtx);
   const id = useRef(`sk${++nextId}`).current;
@@ -249,11 +318,12 @@ export function SecureInput({
   binding.current = {
     value,
     onChange: (v) => {
-      const next = chars(variant === 'phrase' ? v.toLowerCase() : v).slice(0, maxLength).join('');
+      const next = chars(variant === 'phrase' ? normalizePhraseTyping(v) : v).slice(0, maxLength).join(''); // b77n
       onChangeText(next);
     },
     onDone: onSubmit, stayOpen, maxLength, variant, disabled: !editable, doneLabel,
     initialLayer: numeric ? 'numbers' : 'letters',
+    onPaste: variant === 'phrase' ? onPaste : undefined,
   };
   const [localOpen, setLocalOpen] = useState(false);
   const focused = host ? host.activeId === id : localOpen;
@@ -268,6 +338,8 @@ export function SecureInput({
   // the keypad reads the value at key-press time; it only needs a redraw when
   // its own look changes (dimmed while verifying, the Done label)
   useEffect(() => { if (focused && host) host.refresh(); }, [editable, doneLabel]); // eslint-disable-line react-hooks/exhaustive-deps
+  // b77n: the phrase keypad's suggestion strip follows the word being typed
+  useEffect(() => { if (focused && host && variant === 'phrase') host.refresh(); }, [value]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const n = chars(value).length;
   return (
@@ -276,7 +348,7 @@ export function SecureInput({
         onPress={focus}
         accessibilityRole="button"
         accessibilityLabel={accessibilityLabel ?? placeholder ?? 'Secret field'}
-        accessibilityValue={{ text: masked ? `${n} characters` : value }}
+        accessibilityValue={{ text: fieldA11yValue(value, masked) /* audit VAR-23: a count, never the text */ }}
         accessibilityState={{ disabled: !editable }}
         accessibilityHint="Opens the Vardum keyboard"
         style={[s.field, multiline ? s.fieldMulti : null, style, focused && focusedStyle]}
@@ -303,6 +375,9 @@ const s = StyleSheet.create({
   padOff: { opacity: 0.45 },
   row: { flexDirection: 'row', justifyContent: 'center', marginBottom: 8 },
   rowLast: { marginBottom: 2 },
+  suggestRow: { minHeight: 36, marginBottom: 6 },
+  suggest: { flex: 1, height: 34, marginHorizontal: 3, borderRadius: 7, backgroundColor: '#1C1C23', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
+  suggestTxt: { color: '#20D9C2', fontSize: 15, fontWeight: '600' },
   half: { flex: 0.5 },
   key: { flex: 1, height: 44, marginHorizontal: 3, borderRadius: 7, backgroundColor: '#2A2A33', alignItems: 'center', justifyContent: 'center' },
   keyWide: { flex: 1.5 },

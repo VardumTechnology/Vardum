@@ -16,7 +16,11 @@
  */
 import 'fast-text-encoding';
 import 'react-native-get-random-values';
+import { installStrictRandom } from './strict-random';
 import { installNobleSubtle } from './noble-subtle';
+// b77t (audit 5 L-32 / IH I-11): the library above falls back to Math.random in a debug session;
+// this replaces its getRandomValues with one that uses the platform CSPRNG only, or throws
+installStrictRandom();
 // pure-JS crypto.subtle (@noble) — replaces the old hidden-WebView bridge that
 // hung/failed on device (build 12: both identity flows dead at first crypto op).
 installNobleSubtle();
@@ -50,12 +54,15 @@ if (eu && typeof eu.setGlobalHandler === 'function') {
       };
       void KC.setGenericPassword('veil', '1', {
         service: 'veil.veil_sess_crash',
-        accessible: 'WhenUnlockedThisDeviceOnly',
+        accessible: 'AccessibleWhenUnlockedThisDeviceOnly', // b75 (audit 2 V2): the library's real value — an unknown one fell back to a backed-up class
       }).catch(() => undefined);
     } catch { /* keychain unavailable — marker stays unwritten */ }
     try {
       const { Alert } = require('react-native');
-      Alert.alert('Vardum error — photograph this screen', msg + '\n\n' + stack.slice(0, 600));
+      // b73 (audit V-20): release builds show a plain message — the stack (file paths,
+      // internals, sometimes data) is for development builds only
+      if (typeof __DEV__ !== 'undefined' && __DEV__) Alert.alert('Vardum error — photograph this screen', msg + '\n\n' + stack.slice(0, 600));
+      else Alert.alert('Something went wrong', 'Vardum hit an unexpected error. If it keeps happening, restart the app and tell us at support@tryveil.app what you were doing (no screenshots needed).');
     } catch {
       // Alert unavailable — the global above still holds the message.
     }

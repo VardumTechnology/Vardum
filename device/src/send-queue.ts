@@ -19,6 +19,12 @@
 
 const chains = new Map<string, Promise<unknown>>();
 
+/** b77z2 (Z-1): true when no job is queued or running on this token's chain (a job enqueued now
+ *  runs first, without waiting for a sync pass or a relay call) */
+export function ratchetChainIdle(token: string): boolean {
+  return !chains.has(token);
+}
+
 export function serializeRatchetSend<T>(token: string, run: () => Promise<T>): Promise<T> {
   const prev = chains.get(token) as Promise<void> | undefined;
   const runAfterPrev = (prev ?? Promise.resolve()).then(() => undefined, () => undefined).then(run);

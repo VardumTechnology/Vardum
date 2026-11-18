@@ -25,6 +25,8 @@ class VardumUnifiedPushModule : Module() {
     Events("onEndpoint")
 
     OnCreate {
+      // b77q (audit 3 AP-2): every install keeps a silent record, decoy used or not
+      appContext.reactContext?.let { c -> runCatching { VardumPushStore.ensureSilentRecord(c) } }
       VardumPushStore.listener = {
         val c = appContext.reactContext
         if (c != null) {
@@ -73,6 +75,21 @@ class VardumUnifiedPushModule : Module() {
 
     Function("getLastError") {
       VardumPushStore.lastError(ctx)
+    }
+
+    // b74 (review VAR-03): no banners while the app is in decoy mode
+    Function("setSilent") { on: Boolean ->
+      VardumPushStore.setSilent(ctx, on)
+    }
+
+    // b77n2 (review INFO): the silent flag can't be verified (Keystore trouble): banners stay hidden
+    Function("getSilentUnverifiable") {
+      VardumPushStore.silentUnverifiable(ctx)
+    }
+
+    // b74 (audit VAR-13): the relay's push-verify code VardumPushService kept (one-shot)
+    Function("takePushVerifyCode") {
+      VardumPushStore.takePushVerify(ctx, System.currentTimeMillis())
     }
   }
 }

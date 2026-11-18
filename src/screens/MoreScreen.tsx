@@ -39,7 +39,7 @@ export function MoreScreen({ onOpenSettings, onOpenStego, onOpenSettingsTab, web
       <TouchableOpacity style={styles.card} onPress={() => Linking.openURL(webBaseUrl)}>
         <View style={{ flex: 1 }}>
           <Text style={styles.cardTitle}>Security centre</Text>
-          <Text style={styles.cardSub}>Session details, claims register and account recovery.</Text>
+          <Text style={styles.cardSub}>On Vardum's website: who can see what, and account recovery.</Text>
         </View>
         <Text style={styles.arrow}>→</Text>
       </TouchableOpacity>

@@ -635,9 +635,20 @@ export class MlKemBase {
                 const output = this._xof(this._xofSeed);
                 // run rejection sampling directly into pre-allocated matrix slot
                 ctr = indcpaRejUniform(a[i][j], 0, output.subarray(0, 504), 504, N);
-                while (ctr < N) { // if the polynomial hasnt been filled yet with mod q entries
-                    const outputn = output.subarray(504, 672); // take last 168 bytes of byte array from xof
-                    ctr += indcpaRejUniform(a[i][j], ctr, outputn, 168, N - ctr);
+                // b77p (audit VAR-41, FIPS 203 Algorithm 7 SampleNTT): the XOF stream is read IN ORDER until the
+                // polynomial is full. The upstream loop re-read bytes 504..672 every time round, so a fourth block
+                // that still left it short (probability below 2^-100) repeated the same coefficients instead of
+                // squeezing more — a deviation from FIPS 203 (wrong A, no interop), never reached in practice.
+                // Now: bytes 504..672 once, then fresh 168-byte blocks squeezed from the same SHAKE128 state
+                // (writeIntoUnsafe continues where the 672 bytes ended). 504 and 168 are multiples of 3, so the
+                // 3-byte groups of the stream are the same as FIPS 203's.
+                if (ctr < N) ctr += indcpaRejUniform(a[i][j], ctr, output.subarray(504, 672), 168, N - ctr);
+                if (ctr < N) {
+                    const more = new Uint8Array(168);
+                    while (ctr < N) {
+                        this._poolXof.writeIntoUnsafe(more);
+                        ctr += indcpaRejUniform(a[i][j], ctr, more, 168, N - ctr);
+                    }
                 }
             }
         }

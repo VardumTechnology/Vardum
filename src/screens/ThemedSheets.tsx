@@ -126,8 +126,8 @@ function ThemedShareView({
       // with the NEXT binary build; until then this require throws and we
       // fall back to the long-press hint below (the ID text is selectable).
       // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const Clipboard: typeof import('expo-clipboard') = require('expo-clipboard');
-      await Clipboard.setStringAsync(spec.value);
+      const { copySensitive } = require('../clipboard-guard') as typeof import('../clipboard-guard');
+      await copySensitive(spec.value); // b70 (re-review 5): cleared after 60 s like every other copy
       onStatus('Copied');
     } catch {
       onStatus('Copy needs the next app build — long-press the ID above to copy it for now.');

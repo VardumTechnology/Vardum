@@ -24,7 +24,7 @@ public class VeilCryptoModule: Module {
     // taken, and UIScreen.capturedDidChangeNotification for AirPlay /
     // screen recording. The JS side turns these into an in-thread
     // notice to the other party (Snapchat-style, post-hoc deterrent).
-    Events("onScreenCapture")
+    Events("onScreenCapture", "onProtectedData") // b77t (audit 5): + the iOS lock signal below
     // (b64) BUG FIX: the block-based addObserver returns an observer token
     // that MUST be retained — the previous code discarded it, so the token
     // deallocated immediately and iOS stopped delivering the notifications
@@ -48,7 +48,17 @@ public class VeilCryptoModule: Module {
           self?.sendEvent("onScreenCapture", ["kind": "recording", "captured": screen.isCaptured])
         }
       }
-      VeilCryptoModule.captureObservers = [shot, rec]
+      // b77t (audit 5, owner decision "iOS screen lock: fix pre-emptively"): the phone is locking (data
+      // protection is about to drop its keys). JS locks Vardum at once (src/protected-data.ts); iOS may
+      // report a screen lock to the app as 'inactive' only, never 'background'.
+      let pdu = NotificationCenter.default.addObserver(
+        forName: UIApplication.protectedDataWillBecomeUnavailableNotification,
+        object: nil,
+        queue: .main
+      ) { [weak self] _ in
+        self?.sendEvent("onProtectedData", ["available": false])
+      }
+      VeilCryptoModule.captureObservers = [shot, rec, pdu]
     }
     OnDestroy {
       VeilCryptoModule.captureObservers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -134,6 +144,154 @@ public class VeilCryptoModule: Module {
       return true
     }
 
+    // ---------- App-lock MAC (b70 audit fix VAR-07) ----------
+    // The app-lock verifier is HMAC(key, PBKDF2(code)) where the key comes
+    // from an ECDH agreement between a Secure Enclave P-256 key (no biometry:
+    // the lock screen must work without Face ID) and a stored peer public key
+    // whose private half was thrown away at creation. Nobody can compute the
+    // agreement without this phone's Secure Enclave, so a copied lock record
+    // can't be guessed offline.
+    Function("lockMacAvailable") { () -> Bool in
+      SecureEnclave.isAvailable
+    }
+
+    // b75 (audit AL-11): the lock key is a Secure Enclave key whenever lockMacAvailable
+    // is true (iOS has no software fallback for it), so the two answers agree here.
+    Function("lockMacHardware") { () -> Bool in
+      SecureEnclave.isAvailable
+    }
+
+    AsyncFunction("lockMac") { (inputHex: String) -> String in
+      let input = VeilCryptoModule.hexToBytes(inputHex)
+      if input.isEmpty {
+        throw NSError(domain: "VeilCrypto", code: 60, userInfo: [NSLocalizedDescriptionKey: "lockMac: input is not valid hex"])
+      }
+      let seKey = try VeilCryptoModule.loadOrCreateLockKey()
+      let peer = try VeilCryptoModule.loadOrCreateLockPeer()
+      let shared = try seKey.sharedSecretFromKeyAgreement(with: peer)
+      let key = shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: Data(), sharedInfo: Data("vardum-lock-mac-v1".utf8), outputByteCount: 32)
+      let mac = HMAC<SHA256>.authenticationCode(for: Data(input), using: key)
+      return VeilCryptoModule.bytesToHex(Array(mac))
+    }
+
+    AsyncFunction("lockMacReset") { () -> Bool in
+      for q in [VeilCryptoModule.lockKeyQuery(), VeilCryptoModule.lockPeerQuery()] {
+        let del = SecItemDelete(q as CFDictionary)
+        if del != errSecSuccess && del != errSecItemNotFound {
+          throw NSError(domain: "VeilCrypto", code: 61, userInfo: [NSLocalizedDescriptionKey: "lockMacReset: SecItemDelete failed (\(del))"])
+        }
+      }
+      return true
+    }
+
+    // b71 (audit): copy text that stays on this phone (never Universal Clipboard to
+    // the user's other Apple devices) and expires by itself after expireSeconds.
+    AsyncFunction("setSensitiveClipboard") { (text: String, expireSeconds: Double) -> Bool in
+      let item: [String: Any] = ["public.utf8-plain-text": text]
+      UIPasteboard.general.setItems([item], options: [
+        UIPasteboard.OptionsKey.localOnly: true,
+        UIPasteboard.OptionsKey.expirationDate: Date().addingTimeInterval(max(1, expireSeconds)),
+      ])
+      return true
+    }.runOnQueue(.main)
+
+    // b70 (audit L-5): keep a saved file out of iCloud / iTunes backups.
+    // b77s (audit 4 A-01): every wipe drops the app's cookies (React Native's networking uses the shared
+    // HTTPCookieStorage), so a relay that set one can't link requests made before and after a wipe.
+    // (Not compiled in the b77s round: no Xcode there; needs a device build check.)
+    AsyncFunction("clearCookies") { () -> Bool in
+      let store = HTTPCookieStorage.shared
+      for cookie in store.cookies ?? [] { store.deleteCookie(cookie) }
+      return true
+    }
+
+    AsyncFunction("excludeFromBackup") { (path: String) -> Bool in
+      guard var url = URL(string: path), url.isFileURL else { return false }
+      var values = URLResourceValues()
+      values.isExcludedFromBackup = true
+      try url.setResourceValues(values)
+      return true
+    }
+
+    // ---------- b75 (audit AL-10): delete the Secure Enclave wrap key outright ----------
+    // seResetKey always makes a fresh key, so a wiped phone still held one. This
+    // deletes it and makes none (the next hardware-mode seal creates a new one).
+    AsyncFunction("seDeleteKey") { () -> Bool in
+      let del = SecItemDelete(VeilCryptoModule.seMatchQuery() as CFDictionary)
+      if del != errSecSuccess && del != errSecItemNotFound {
+        throw NSError(domain: "VeilCrypto", code: 46, userInfo: [NSLocalizedDescriptionKey: "seDeleteKey: SecItemDelete failed (\(del))"])
+      }
+      return try VeilCryptoModule.loadSeKey() == nil
+    }
+
+    // ---------- b75 (audit AL-6): container keys ----------
+    // Every secure-store value is AES-GCM sealed (in JS) under a random 256-bit key
+    // kept in a file in this app's Application Support directory, excluded from
+    // backups, with file protection "until first unlock" (background receive reads
+    // the login while the phone is locked). Keychain items survive deleting the app;
+    // this file does not, so whatever the Keychain keeps after a delete is useless.
+    // Deleting the file is the crypto-shred every wipe does first.
+    // File: [ver=1][gen:4 BE][key:32].
+    // an empty dictionary = no file in this slot (JS reads it as null)
+    AsyncFunction("ckRead") { (slot: String) -> [String: Any] in
+      let url = try VeilCryptoModule.ckFile(slot)
+      if !FileManager.default.fileExists(atPath: url.path) { return [:] }
+      let data = try Data(contentsOf: url) // a read error throws: never "absent"
+      let b = [UInt8](data)
+      if b.count != 1 + 4 + 32 || b[0] != 1 {
+        throw NSError(domain: "VeilCrypto", code: 80, userInfo: [NSLocalizedDescriptionKey: "container key file is malformed"])
+      }
+      let gen = Int(UInt32(b[1]) << 24 | UInt32(b[2]) << 16 | UInt32(b[3]) << 8 | UInt32(b[4]))
+      return ["key": Data(b[5..<37]).base64EncodedString(), "gen": gen]
+    }
+
+    AsyncFunction("ckCreate") { (slot: String, gen: Int) -> [String: Any] in
+      let url = try VeilCryptoModule.ckFile(slot)
+      // never overwrite: a key in use is only ever replaced by remove + create
+      if FileManager.default.fileExists(atPath: url.path) {
+        throw NSError(domain: "VeilCrypto", code: 81, userInfo: [NSLocalizedDescriptionKey: "container key slot is in use"])
+      }
+      var key = [UInt8](repeating: 0, count: 32)
+      let rng = SecRandomCopyBytes(kSecRandomDefault, 32, &key)
+      if rng != errSecSuccess {
+        throw NSError(domain: "VeilCrypto", code: 82, userInfo: [NSLocalizedDescriptionKey: "SecRandomCopyBytes failed (\(rng))"])
+      }
+      defer { VeilCryptoModule.wipe(&key) }
+      let g = UInt32(truncatingIfNeeded: gen)
+      var out: [UInt8] = [1, UInt8(g >> 24 & 0xff), UInt8(g >> 16 & 0xff), UInt8(g >> 8 & 0xff), UInt8(g & 0xff)]
+      out.append(contentsOf: key)
+      defer { VeilCryptoModule.wipe(&out) }
+      try VeilCryptoModule.ckWriteDurably(Data(out), to: url)
+      return ["key": Data(key).base64EncodedString(), "gen": gen]
+    }
+
+    AsyncFunction("ckRemove") { (slot: String) -> Bool in
+      let url = try VeilCryptoModule.ckFile(slot)
+      try VeilCryptoModule.ckShred(url)
+      return !FileManager.default.fileExists(atPath: url.path)
+    }
+
+    AsyncFunction("ckRemoveAll") { () -> Bool in
+      let dir = try VeilCryptoModule.ckDir()
+      for f in (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [] {
+        try VeilCryptoModule.ckShred(f)
+      }
+      return true
+    }
+
+    // b75 (audit DEV-I6): the key file is protected only by iOS file protection, readable by
+    // this app after the first unlock; no Secure Enclave or Keychain key wraps it. It used to
+    // answer a constant hardware: true.
+    Function("ckInfo") { () -> [String: Bool] in
+      ["hardware": false, "unlockBound": false]
+    }
+
+    // Time since boot, counting sleep (Darwin CLOCK_MONOTONIC). Changing the
+    // phone's clock doesn't move it, so lockouts can't be skipped that way.
+    Function("uptimeMs") { () -> Double in
+      Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000.0
+    }
+
     AsyncFunction("pbkdf2Sha256") { (password: String, saltHex: String, iterations: Int, dkLen: Int) -> String in
         let salt = VeilCryptoModule.hexToBytes(saltHex)
         if salt.isEmpty {
@@ -195,7 +353,7 @@ public class VeilCryptoModule: Module {
         guard let pt = Data(base64Encoded: plaintextBase64) else {
           throw NSError(domain: "VeilCrypto", code: 12, userInfo: [NSLocalizedDescriptionKey: "aesGcmEncrypt: invalid base64 plaintext"])
         }
-        let aad = Data(VeilCryptoModule.hexToBytes(aadHex))
+        let aad = Data(try VeilCryptoModule.strictHexToBytes(aadHex)) // b77t (audit 5 L-31): malformed AAD hex is refused, never read as no AAD
         let key = SymmetricKey(data: Data(keyBytes))
         let nonce = try AES.GCM.Nonce(data: Data(iv))
         let sealed = try AES.GCM.seal(pt, using: key, nonce: nonce, authenticating: aad)
@@ -218,7 +376,7 @@ public class VeilCryptoModule: Module {
         if combined.count < 16 {
           throw NSError(domain: "VeilCrypto", code: 16, userInfo: [NSLocalizedDescriptionKey: "aesGcmDecrypt: ciphertext shorter than a bare GCM tag"])
         }
-        let aad = Data(VeilCryptoModule.hexToBytes(aadHex))
+        let aad = Data(try VeilCryptoModule.strictHexToBytes(aadHex)) // b77t (audit 5 L-31): malformed AAD hex is refused, never read as no AAD
         let key = SymmetricKey(data: Data(keyBytes))
         let nonce = try AES.GCM.Nonce(data: Data(iv))
         let ct = combined.prefix(combined.count - 16)
@@ -338,6 +496,134 @@ public class VeilCryptoModule: Module {
     return try createSeKey()
   }
 
+  // ---------- App-lock key (VAR-07) ----------
+  private static let lockKeyService = "au.com.mattthemagicalmentalist.veil.lock-key"
+  private static let lockPeerService = "au.com.mattthemagicalmentalist.veil.lock-peer"
+
+  private static func lockKeyQuery() -> [String: Any] {
+    [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: lockKeyService, kSecAttrAccount as String: "veil-lock"]
+  }
+
+  private static func lockPeerQuery() -> [String: Any] {
+    [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: lockPeerService, kSecAttrAccount as String: "veil-lock"]
+  }
+
+  /// Read one generic-password item. nil only when it doesn't exist; any other
+  /// status throws, so "can't read it now" never becomes "make a new one".
+  private static func readItem(_ query: [String: Any]) throws -> Data? {
+    var q = query
+    q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
+    var item: CFTypeRef?
+    let status = SecItemCopyMatching(q as CFDictionary, &item)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess, let data = item as? Data else {
+      throw NSError(domain: "VeilCrypto", code: 62, userInfo: [NSLocalizedDescriptionKey: "lock key lookup failed (\(status))"])
+    }
+    return data
+  }
+
+  private static func addItem(_ query: [String: Any], _ data: Data) throws {
+    var add = query
+    add[kSecValueData as String] = data
+    add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    let status = SecItemAdd(add as CFDictionary, nil)
+    guard status == errSecSuccess else {
+      throw NSError(domain: "VeilCrypto", code: 63, userInfo: [NSLocalizedDescriptionKey: "lock key could not be stored (SecItemAdd \(status))"])
+    }
+  }
+
+  private static func loadOrCreateLockKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
+    if let data = try readItem(lockKeyQuery()) {
+      guard let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) else {
+        throw NSError(domain: "VeilCrypto", code: 64, userInfo: [NSLocalizedDescriptionKey: "stored lock key is unreadable"])
+      }
+      return key
+    }
+    var err: Unmanaged<CFError>?
+    guard let acl = SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.privateKeyUsage], &err) else {
+      throw NSError(domain: "VeilCrypto", code: 65, userInfo: [NSLocalizedDescriptionKey: "lock key access control could not be created"])
+    }
+    let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: acl)
+    try addItem(lockKeyQuery(), key.dataRepresentation)
+    return key
+  }
+
+  private static func loadOrCreateLockPeer() throws -> P256.KeyAgreement.PublicKey {
+    if let data = try readItem(lockPeerQuery()) {
+      guard let pub = try? P256.KeyAgreement.PublicKey(x963Representation: data) else {
+        throw NSError(domain: "VeilCrypto", code: 64, userInfo: [NSLocalizedDescriptionKey: "stored lock peer key is unreadable"])
+      }
+      return pub
+    }
+    // the private half goes out of scope here and is never stored
+    let pub = P256.KeyAgreement.PrivateKey().publicKey
+    try addItem(lockPeerQuery(), pub.x963Representation)
+    return pub
+  }
+
+  // ---------- b75 (AL-6) container key files ----------
+  private static func ckDir() throws -> URL {
+    let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    var dir = base.appendingPathComponent("vardum-ck", isDirectory: true)
+    if !FileManager.default.fileExists(atPath: dir.path) {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+        attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+    }
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    try dir.setResourceValues(values)
+    return dir
+  }
+
+  private static func ckFile(_ slot: String) throws -> URL {
+    guard slot.count == 1, let c = slot.unicodeScalars.first, c.value >= 0x61 && c.value <= 0x7a else {
+      throw NSError(domain: "VeilCrypto", code: 83, userInfo: [NSLocalizedDescriptionKey: "bad container key slot"])
+    }
+    return try ckDir().appendingPathComponent("\(slot).ck")
+  }
+
+  /// temp file, F_FULLFSYNC, rename, then the directory: durable before the key is used
+  private static func ckWriteDurably(_ data: Data, to url: URL) throws {
+    let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+    _ = FileManager.default.createFile(atPath: tmp.path, contents: nil,
+      attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+    let fh = try FileHandle(forWritingTo: tmp)
+    do {
+      try fh.write(contentsOf: data)
+      _ = fcntl(fh.fileDescriptor, F_FULLFSYNC)
+      try fh.close()
+    } catch {
+      try? fh.close()
+      try? FileManager.default.removeItem(at: tmp)
+      throw error
+    }
+    if rename(tmp.path, url.path) != 0 {
+      try? FileManager.default.removeItem(at: tmp)
+      throw NSError(domain: "VeilCrypto", code: 84, userInfo: [NSLocalizedDescriptionKey: "container key file could not be placed"])
+    }
+    var u = url
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    try? u.setResourceValues(values)
+    let dfd = open(url.deletingLastPathComponent().path, O_RDONLY)
+    if dfd >= 0 { _ = fcntl(dfd, F_FULLFSYNC); close(dfd) }
+  }
+
+  /// overwrite with zeros, sync, delete. b75 round 2 (audit I2): the delete (the key is gone)
+  /// is the protection; the zero overwrite is best-effort (flash storage may keep old blocks).
+  private static func ckShred(_ url: URL) throws {
+    if !FileManager.default.fileExists(atPath: url.path) { return }
+    if let fh = try? FileHandle(forUpdating: url) {
+      let n = (try? fh.seekToEnd()) ?? 0
+      try? fh.seek(toOffset: 0)
+      try? fh.write(contentsOf: Data(count: Int(n)))
+      _ = fcntl(fh.fileDescriptor, F_FULLFSYNC)
+      try? fh.close()
+    }
+    try FileManager.default.removeItem(at: url)
+  }
+
   /// Must match PBKDF2_MIN_ITERATIONS / PBKDF2_MAX_ITERATIONS in vendor/device/src/kdf.ts.
   private static let pbkdf2MinIterations = 100_000
   private static let pbkdf2MaxIterations = 1_000_000
@@ -348,6 +634,16 @@ public class VeilCryptoModule: Module {
     bytes.withUnsafeMutableBytes { buf in
       if let p = buf.baseAddress { _ = memset_s(p, n, 0, n) }
     }
+  }
+
+  /// b77t (audit 5 L-31, IH DEV-8): hex that must be well-formed (the AES-GCM AAD). hexToBytes returns [] for
+  /// malformed hex, which for the AAD meant "no AAD" (fail open); this throws instead. "" = no AAD.
+  private static func strictHexToBytes(_ hex: String) throws -> [UInt8] {
+    let out = VeilCryptoModule.hexToBytes(hex)
+    if out.count * 2 != hex.utf8.count {
+      throw NSError(domain: "VeilCrypto", code: 17, userInfo: [NSLocalizedDescriptionKey: "malformed hex (AAD)"])
+    }
+    return out
   }
 
   private static func hexToBytes(_ hex: String) -> [UInt8] {

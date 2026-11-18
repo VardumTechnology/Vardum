@@ -1,8 +1,12 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import * as LocalAuthentication from 'expo-local-authentication';
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, TextInput, Image } from 'react-native';
 import { useThemedPrompt } from './ThemedPrompt';
-import { PASSWORD_MIN, PASSWORD_MAX, passwordProblem } from '../password';
+import { PASSWORD_MIN, PASSWORD_MAX, passwordProblem, SOFT_LOCK_NOTE, WIPE_AFTER_FAILS_SETUP, DECOY_LOCKOUT_NOTE /* b77s (audit 4 DV-1) */, DECOY_SETUP_NOTE /* b77t (M-E) */ } from '../password';
+import { lockHardwareKeyAvailable } from '../../vendor/device/src/applock';
 import { SECURE_CHIP, BIOMETRIC } from '../platformText';
+import { passwordStepCopy } from '../restore-password'; // b77g (G-1)
+import { SELF_DESTRUCT_CLOCK_NOTE, selfDestructArmNow } from '../relay-clock'; // b77t (audit 5 L-4); b77t2 (info)
 import {
   type VeilSettings, BURN_OPTIONS, EXPIRY_OPTIONS, QUIET_OPTIONS,
   SELF_DESTRUCT_HOURS, SELF_DESTRUCT_WARN_HOURS, SELF_DESTRUCT_DAYS,
@@ -17,7 +21,9 @@ import {
  *      answers ARE the configuration (recommendations are labelled, never
  *      applied on the user's behalf)
  *   3. Veil ID + nickname + mandatory passcode, then "Apply these settings"
- * No skip or cancel exists in 'full' mode. A phrase RESTORE never enters it.
+ * No skip or cancel exists in 'full' mode. A phrase RESTORE never enters it;
+ * b77f (audit ZTE77-4): a restore that left no app lock opens 'passwordOnly'
+ * (the last page, password required, no cancel) before the app.
  *
  * introOnly: replays the intro slides from Settings ("View the introduction"),
  * without the checkup bridge slide.
@@ -30,7 +36,7 @@ interface IntroSlide { title: string; body: string; /** hands over to the checku
 const INTROS: IntroSlide[] = [
   {
     title: 'Your 24 words are you.',
-    body: 'No email, no phone number, no name. Those words are your identity and your sign-in, and they never leave this phone. Keep them safe: if they’re lost, no one, including us, can get your account back.',
+    body: 'No email, no phone number, no name. Those words are your identity and your sign-in. The words themselves never leave this phone; Vardum signs in with a code worked out from them that can’t be turned back into the words. Keep them safe: if they’re lost, no one, including us, can get your account back.',
   },
   {
     title: 'Only you and the people you talk to can read your messages.',
@@ -38,7 +44,7 @@ const INTROS: IntroSlide[] = [
   },
   {
     title: 'Check who you’re talking to.',
-    body: 'When you connect with someone new, you each see a short code. Compare them in person or on a call. If they match, nobody is listening in between.',
+    body: 'When you connect with someone new, you each see a safety code. Compare them in person or on a call. If they match, nobody is listening in between.',
   },
   {
     title: 'Know the limits.',
@@ -56,7 +62,7 @@ interface DialStep {
   // verbatim into settings at finish ({...settings, ...a}); a key that is
   // not a real field is silently discarded by mergeSettings' clamp and the
   // dial falls back to its default (owner repro Sept 27: chose "5 min" burn
-  // in onboarding, settings kept the 7200 fallback, lounge created at 2h).
+  // in onboarding, settings kept the 7200 fallback, a group created at 2h).
   key: 'burnTtlSeconds' | 'expireAfterSeconds' | 'retentionHours' | 'localHistory' | 'storageMode' | 'holdUntilUnlock' | 'selfDestruct' | 'readReceipts';
   title: string;
   desc: string;
@@ -82,15 +88,15 @@ const DIALS: DialStep[] = [
   },
   {
     key: 'retentionHours', title: 'End quiet threads after',
-    desc: 'A conversation with no messages for this long ends and deletes itself from Vardum’s server. Off = never ended automatically (the server still removes records abandoned for a year).',
-    defends: 'Defends against: old conversations lingering on Vardum’s server.',
+    desc: 'When a one-to-one chat has had no messages, sent or received, for this long, this phone ends it, as if you had tapped End chat (the shorter of this and the chat’s own quiet time applies). Off = only the chat’s own quiet time applies (a chat started with Off is never ended for being quiet); Vardum’s server closes a chat’s mailboxes after 30 days without use.', // b77u (audit 6 W8)
+    defends: 'Defends against: old one-to-one chats lingering on this phone and on Vardum’s server.',
     options: QUIET_OPTIONS.map((o) => ({ label: o.label + (o.value === 168 ? '  (Recommended)' : ''), value: o.value })),
   },
   {
     key: 'localHistory', title: 'Keep conversation history on this device',
     // b199 (owner, Oct 16): shortened so each question fits on one screen
     desc: 'On = an encrypted copy of your chats stays on this phone. Off = messages are read in the moment and forgotten when you leave the chat. Saved history is the first thing a phone-extraction tool recovers from a seized, unlocked phone.',
-    defends: 'Turning it Off defends against: a seized phone revealing who you talked to and what was said. Nothing-at-Rest forces this off.',
+    defends: 'Turning it Off defends against: a seized phone revealing what was said. Your login stays on the phone, so someone holding it could still ask Vardum’s server which Vardum IDs you have chats with. Nothing-at-Rest forces this off.', // b75 (audit AL-8): pins are kept; b75 (audit DEV-L5): the kept login can list the chats
     // b199 (owner decision, Oct 16): On is the recommended default
     options: [{ label: 'On  (Recommended)', value: true }, { label: 'Off', value: false }],
   },
@@ -102,21 +108,22 @@ const DIALS: DialStep[] = [
     defends: 'Defends against: keys being extracted from a seized device by phone-extraction tools.',
     options: [
       { label: 'Sealed-at-rest  (most convenient)', value: 'device', sub: 'Encrypted on this phone, no prompts. Most exposed if the phone is seized after it was unlocked.' },
-      { label: 'Security chip  (Recommended)', value: 'hardware', sub: `Sealed in ${SECURE_CHIP}; opens with ${BIOMETRIC}. Much harder to extract.` },
-      { label: 'Nothing-at-Rest  (strongest)', value: 'memory', sub: 'Memory only, wiped whenever Vardum leaves the screen. You restore with your 24 words each time.' },
+      // audit VAR-60: the same scope Settings states — only the identity key is in the chip
+      { label: 'Security chip  (Recommended)', value: 'hardware', sub: `Your identity key is sealed in ${SECURE_CHIP} and opens with ${BIOMETRIC}, so it is much harder to extract. Chat keys and saved history are stored as in Sealed-at-rest.` },
+      { label: 'Nothing-at-Rest  (strongest)', value: 'memory', sub: 'Each time you leave Vardum, your identity, chats, notes, vaults and keys are wiped from this phone; you restore with your 24 words. Kept so Vardum can sign back in: your login, settings, app lock and pinned contacts (their Vardum IDs and verified marks), your notes’ version numbers (so the server can’t pass off an older copy of a note), a record of contact requests already answered (fingerprints only), the self-destruct clock and this phone’s app ID. With the kept login, the server can still be asked which Vardum IDs you have chats with.' }, // b75 (audit AL-8): says exactly what stays; (DEV-L5): and what the login still reveals; b75 round 2 (audit D4): the notes' version marks
     ],
   },
   {
     key: 'holdUntilUnlock', title: 'Hold until unlock',
-    desc: 'Delivery is held while the phone is locked — a locked phone holds no message data at all.',
+    desc: 'Delivery is held while the phone is locked: nothing new arrives on a locked phone, and incoming calls don’t ring until you unlock. Messages you already have stay saved on the phone.',
     defends: 'Defends against: message data arriving while the device is unattended.',
     options: [{ label: 'On', value: true }, { label: 'Off  (Recommended)', value: false }],
   },
   {
     key: 'selfDestruct', title: 'Self-destruct countdown',
-    desc: `Everything Vardum keeps on the device wipes on a fixed ${SELF_DESTRUCT_DAYS}-day clock; messaging does not reset it. A warning appears ${SELF_DESTRUCT_HOURS - SELF_DESTRUCT_WARN_HOURS} hours before, extendable by another ${SELF_DESTRUCT_DAYS} days. Opt-in — never armed silently by setup.`,
+    desc: `A fixed ${SELF_DESTRUCT_DAYS}-day clock; messaging does not reset it. Once it runs out, Vardum wipes what it keeps on this phone the next time it opens, or straight away if it is running. A warning appears ${SELF_DESTRUCT_HOURS - SELF_DESTRUCT_WARN_HOURS} hours before, extendable by another ${SELF_DESTRUCT_DAYS} days. ${SELF_DESTRUCT_CLOCK_NOTE} Opt-in — never armed silently by setup.`,
     defends: 'Defends against: a device being kept and inspected later.',
-    options: [{ label: 'Off  (Recommended)', value: false }, { label: `On — wipe everything after ${SELF_DESTRUCT_DAYS} days`, value: true }],
+    options: [{ label: 'Off  (Recommended)', value: false }, { label: `On — wipe after ${SELF_DESTRUCT_DAYS} days (when Vardum next opens)`, value: true }],
   },
   {
     key: 'readReceipts', title: 'Read receipts',
@@ -131,7 +138,10 @@ export interface OnboardingScreenProps {
   onApply: (s: VeilSettings) => void;
   onDone: () => void;
   veilId?: string | null;
-  mode?: 'full' | 'introOnly' | 'checkupOnly' | 'idOnly';
+  /** b77f (audit ZTE77-4) passwordOnly: after a phrase restore that left no app lock — straight
+   *  to the last page with the password required; no checkup, no cancel, and finishing changes
+   *  only the nickname and the pending flag (the restored dials stay as they are) */
+  mode?: 'full' | 'introOnly' | 'checkupOnly' | 'idOnly' | 'passwordOnly';
   /** (b67) passcode is mandatory at the end of the privacy setup */
   appLockEnabled?: boolean;
   onSetAppLock?: (pass: string, decoy?: string | null, duress?: string | null) => Promise<void>;
@@ -147,13 +157,21 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
   const intros = mode === 'introOnly' ? INTROS.filter((s) => !s.bridge) : INTROS;
   const NI = intros.length;
   // step: 0..NI-1 intros, NI..NI+DIALS-1 checkup dials, last = Veil ID + nickname + passcode
-  const [step, setStep] = useState(mode === 'checkupOnly' ? NI : mode === 'idOnly' ? NI + DIALS.length : 0);
+  const [step, setStep] = useState(mode === 'checkupOnly' ? NI : (mode === 'idOnly' || mode === 'passwordOnly') ? NI + DIALS.length : 0);
   const [answers, setAnswers] = useState<Partial<VeilSettings>>({});
+  // b71 (device test): the security chip needs a screen lock or an enrolled biometric to
+  // open the key; on a phone with neither, choosing it failed and reverted
+  const [deviceSecure, setDeviceSecure] = useState(true);
+  useEffect(() => {
+    LocalAuthentication.getEnrolledLevelAsync()
+      .then((lvl) => setDeviceSecure(lvl !== LocalAuthentication.SecurityLevel.NONE))
+      .catch(() => undefined);
+  }, []);
   const [nickname, setNickname] = useState(settings.nickname ?? '');
   const [selfDestructArmed, setSelfDestructArmed] = useState(0);
   // (b67) mandatory passcode at the end of privacy setup (full + checkupOnly)
   const { node: promptNode, ask } = useThemedPrompt();
-  const passRequired = (mode === 'full' || mode === 'checkupOnly') && !appLockEnabled;
+  const passRequired = (mode === 'full' || mode === 'checkupOnly' || mode === 'passwordOnly') && !appLockEnabled;
   const [passSet, setPassSet] = useState(false);
   const [passBusy, setPassBusy] = useState(false);
 
@@ -165,23 +183,23 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
       const pass = (await ask({
         title: 'Set your password',
         message: `${PASSWORD_MIN} to ${PASSWORD_MAX} characters: letters, numbers, symbols or spaces. Required to finish privacy setup — it locks Vardum on this device.`,
-        input: 'secure', maxLength: PASSWORD_MAX, submitLabel: 'Next',
+        input: 'code', maxLength: PASSWORD_MAX, submitLabel: 'Next',
       })) as string | null;
       if (!pass) return;
       const problem = passwordProblem(pass);
       if (problem) { await ask({ title: 'Password too short', message: problem, info: true }); return; }
-      const again = (await ask({ title: 'Type it again', message: 'To make sure there’s no typo.', input: 'secure', maxLength: PASSWORD_MAX, submitLabel: 'Next' })) as string | null;
+      const again = (await ask({ title: 'Type it again', message: 'To make sure there’s no typo.', input: 'code', maxLength: PASSWORD_MAX, submitLabel: 'Next' })) as string | null;
       if (again === null) return;
       if (again !== pass) { await ask({ title: 'Those didn’t match', message: 'Nothing was saved. Try again.', info: true }); return; }
       const decoy = (await ask({
         title: 'Decoy code (optional)',
-        message: 'Cancel to skip. Opens a harmless empty environment if entered at the lock screen. Any characters, 4 to 50.',
-        input: 'secure', maxLength: PASSWORD_MAX, submitLabel: 'Next',
+        message: `Cancel to skip. ${DECOY_SETUP_NOTE}${DECOY_LOCKOUT_NOTE} Any characters, ${PASSWORD_MIN} to ${PASSWORD_MAX}.` + (lockHardwareKeyAvailable() ? '' : SOFT_LOCK_NOTE),
+        input: 'code', maxLength: PASSWORD_MAX, submitLabel: 'Next',
       })) as string | null;
       const duress = (await ask({
         title: 'Duress code (optional)',
-        message: 'Cancel to skip. Best-effort deletion of Vardum data if entered at the lock screen. Any characters, 4 to 50.',
-        input: 'secure', maxLength: PASSWORD_MAX, submitLabel: 'Save',
+        message: `Cancel to skip. Best-effort deletion of Vardum data if entered at the lock screen. It can’t undo a copy of the phone’s storage taken earlier. Any characters, ${PASSWORD_MIN} to ${PASSWORD_MAX}.` + (lockHardwareKeyAvailable() ? '' : SOFT_LOCK_NOTE),
+        input: 'code', maxLength: PASSWORD_MAX, submitLabel: 'Save',
       })) as string | null;
       for (const [label, code] of [['Decoy code', decoy], ['Duress code', duress]] as const) {
         const p = code ? passwordProblem(code) : null;
@@ -189,6 +207,11 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
       }
       await onSetAppLock(pass, decoy || null, duress || null);
       setPassSet(true);
+      // audit VAR-18: the erase-after-10 choice is put to the user here (off unless they turn it on)
+      if (!settings.wipeAfterFails) {
+        const wipe = (await ask({ title: 'Erase after 10 wrong passwords?', message: WIPE_AFTER_FAILS_SETUP, confirm: true, submitLabel: 'Turn on' })) as boolean;
+        if (wipe) setAnswers((a) => ({ ...a, wipeAfterFails: true }));
+      }
     } catch (e) {
       await ask({ title: 'Could not save the password', message: String((e as Error).message || e), info: true });
     } finally { setPassBusy(false); }
@@ -255,7 +278,11 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
             <Text style={[styles.defends, styles.fullW]}>{d.defends}</Text>
           </View>
           <View style={d.options.length > 4 ? styles.optGrid : null}>
-            {d.options.map((o) => {
+            {(d.key === 'storageMode' && !deviceSecure
+              ? d.options.filter((o) => o.value !== 'hardware').map((o) => (o.value === 'device'
+                ? { ...o, label: 'Sealed-at-rest  (Recommended)', sub: `${o.sub} The security chip needs a screen lock — set one in this phone's settings to use it.` }
+                : o))
+              : d.options).map((o) => {
               const on = answers[d.key as keyof VeilSettings] === o.value;
               const [main, note] = o.label.split('  (');
               const grid = d.options.length > 4;
@@ -267,7 +294,7 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
                     setAnswers((a) => {
                       const next = { ...a, [d.key]: o.value } as Partial<VeilSettings>;
                       if (d.key === 'storageMode' && o.value === 'memory') next.localHistory = false;
-                      if (d.key === 'selfDestruct') setSelfDestructArmed(o.value === true ? Date.now() : 0);
+                      if (d.key === 'selfDestruct') setSelfDestructArmed(o.value === true ? selfDestructArmNow() : 0); // b77t2 (info): relay time when known
                       return next;
                     });
                     setStep(step + 1);
@@ -308,13 +335,18 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
           <Text style={styles.pageTitle}>Your Vardum ID</Text>
           <Text style={styles.idText}>{veilId ?? 'Your identity will publish a Vardum ID shortly.'}</Text>
           <Text style={styles.pageBody}>Share your Vardum ID with people you want to speak with. They use it to look you up and verify they are speaking with you.</Text>
+          {mode === 'passwordOnly' ? (
+            <Text style={styles.pageBody}>{passwordStepCopy(settings) /* b77g (G-1): "restored" only after a restore */}</Text>
+          ) : null}
         </View>
-        <Text style={styles.label}>Nickname for this device (local only)</Text>
+        {/* b77k (IP77-3): it said "local only" / "never leaves this device", but the nickname goes to
+            your groups and (since b77k) your 1:1 chats, inside their end-to-end encryption */}
+        <Text style={styles.label}>Nickname (shown to anyone you chat with, including through your invite link)</Text>
         <TextInput
           style={styles.input}
           value={nickname}
           onChangeText={setNickname}
-          placeholder="Optional — never leaves this device"
+          placeholder="Optional — sent only inside your encrypted chats"
           placeholderTextColor="#5E6464"
         />
         {passRequired ? (
@@ -336,12 +368,18 @@ export function OnboardingScreen({ settings, onApply, onDone, veilId, mode = 'fu
           style={[styles.btn, !canFinish && styles.btnOff]}
           disabled={!canFinish}
           onPress={() => {
+            if (mode === 'passwordOnly') {
+              // b77f (ZTE77-4): a restore keeps its own dials; only the nickname and the flag change
+              onApply({ ...settings, nickname, ...(answers.wipeAfterFails ? { wipeAfterFails: true } : {}) /* audit VAR-18 */, restorePasswordPending: false, passwordStepDone: true /* b77f2 (F-1): never asked again by the boot guard */ } as VeilSettings);
+              onDone();
+              return;
+            }
             const a = answers;
             onApply({
               ...settings,
               ...a,
               nickname,
-              selfDestructArmedAt: a.selfDestruct === true ? selfDestructArmed || Date.now() : 0,
+              selfDestructArmedAt: a.selfDestruct === true ? selfDestructArmed || selfDestructArmNow() : 0,
               setupDone: true,
               onboardingPending: false,
             } as VeilSettings);

@@ -10,6 +10,8 @@ Website: https://tryvardum.app
 
 ## News
 
+**November 2026:** Source updated to build 77 (protocol veil-ratchet-8): sealed sender, message padding, one-time prekeys, registration lock, and fixes from internal review rounds 4 to 6.
+
 **October 2026:** VEIL is now Vardum. Final iPhone native beta build: https://testflight.apple.com/join/Aqay7XH2 · Android beta: 12 spots, email matt@tryvardum.app, or download for GrapheneOS Hardened "Graph": https://tryvardum.app/android/ · Everything else: https://tryvardum.app · Claims: https://tryvardum.app/claims/
 
 ## What it does
@@ -50,7 +52,7 @@ Every claim is listed with its status and limits in the [claims register](https:
 | `src/` | The React Native app: the screens, calls, notifications and privacy controls |
 | `app.json` | The Expo configuration |
 
-This is a source copy for review. In the app's own repository `crypto-core/` and `device/` live under `vendor/`, which is why app imports read `../vendor/...`. One value is left out: the founding-tester forum's group token in `device/src/lounge.ts`, because it is part of that forum's private invite link.
+This is a source copy for review. In the app's own repository `crypto-core/` and `device/` live under `vendor/`, which is why app imports read `../vendor/...`. Tests, audit working files, deployment scripts and image/sound assets are not included.
 
 ## Building
 

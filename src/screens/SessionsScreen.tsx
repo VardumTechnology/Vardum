@@ -1,7 +1,9 @@
 import React from 'react';
+import { titleInitials } from '../../vendor/device/src/names'; // b77k2: initials without the isolate marks
 import { View, Text, TouchableOpacity, StyleSheet, ScrollView, RefreshControl, Alert, Share, ActivityIndicator, Image } from 'react-native';
 import { useThemedPrompt } from './ThemedPrompt';
 import { IdentityCard } from './SettingsScreen';
+import { isolateName } from '../../vendor/device/src/names';
 
 export interface SessionRow {
   token: string;
@@ -17,27 +19,25 @@ export interface SessionRow {
   peerVeilId?: string;
   /** MY side completed the per-session verify ceremony */
   myVerified?: boolean;
-  /** the PEER's side completed it */
-  peerVerified?: boolean;
   /** b155: contact (pinned) session — trust comes from the pin, no ceremony state */
   contact?: boolean;
+  /** b71 (audit): a contact request from a Vardum ID that isn't pinned, not answered yet */
+  request?: boolean;
+  /** b71: an incoming request from a pinned contact (opens without Accept) */
+  incoming?: boolean;
+  /** b77q review (J2-3): listed from this phone's own sealed state (not from a relay row) */
+  local?: boolean;
   /** b178: true when this account was the INITIATOR (we created it) — the
    *  new-invite banner must not fire for our own creations. */
   mine?: boolean;
-  /** b162: PEER's last presence beat (relay seen_at, ms epoch; 0 = never seen).
-   *  Web parity: fresh within 15 s reads as online. Groups never carry this. */
-  peerSeenAt?: number;
+  /* b77 (sealed sender): the b162 presence field and its "online" dot are gone —
+   * relay presence would pair the two mailboxes of a chat. */
   /** b62 groups: set when this row is a veil-group-1 thread */
   groupToken?: string;
   /** b71 dedupe (internal, never rendered): true when this row is the
    *  group's MAIN session — mine AND no peer on the row. Used by
    *  collapseGroupRows() to prefer the canonical thread over invite rows. */
   mainGroupRow?: boolean;
-
-  /** b187/b188: lounge/forum thread — local record, no invite session.
-   *  lounge = founder broadcast (read-only); forum = writable. */
-  lounge?: boolean;
-  forum?: boolean;
 }
 
 export interface SessionsScreenProps {
@@ -54,11 +54,6 @@ export interface SessionsScreenProps {
   /** b139 funnel fix: pinned local welcome thread (shown until dismissed) */
   welcomeVisible?: boolean;
   onOpenWelcome?: () => void;
-  /** b196-r5: Founding Tester Forum banner (non-members only) */
-  forumBannerVisible?: boolean;
-  forumBannerBusy?: boolean;
-  onJoinForum?: () => void;
-  onDismissForumBanner?: () => void;
   /** b199 (owner, Oct 16): the identity card from Settings sits at the top of Conversations */
   identity?: { veilId: string | null; nickname: string; onShare: () => void; onShowQr?: () => void };
 }
@@ -72,7 +67,7 @@ export interface SessionsScreenProps {
  * thread. Sections answer "what is this thread?" at a glance: Groups, Chats,
  * Waiting to join, Ended.
  */
-export function SessionsScreen({ sessions, busy, onRefresh, onOpenSession, onNewSession, onCreateInvite, onJoinInvite, welcomeVisible, onOpenWelcome, forumBannerVisible, forumBannerBusy, onJoinForum, onDismissForumBanner, identity }: SessionsScreenProps) {
+export function SessionsScreen({ sessions, busy, onRefresh, onOpenSession, onNewSession, onCreateInvite, onJoinInvite, welcomeVisible, onOpenWelcome, identity }: SessionsScreenProps) {
   const [inviteBusy, setInviteBusy] = React.useState(false);
   const [inviteLink, setInviteLink] = React.useState<string | null>(null);
   // BUG FIXED (Sept 19): "+ New" used to open ActionSheetIOS — a plain system
@@ -112,26 +107,27 @@ export function SessionsScreen({ sessions, busy, onRefresh, onOpenSession, onNew
     } finally { setInviteBusy(false); }
   };
 
-  const isGroupRow = (s: SessionRow) => !!(s.groupToken || s.lounge || s.forum);
+  const isGroupRow = (s: SessionRow) => !!s.groupToken;
   const groups = sessions.filter(isGroupRow);
   const rest = sessions.filter((s) => !isGroupRow(s));
   const chats = rest.filter((s) => s.status === 'active');
-  const waiting = rest.filter((s) => s.status === 'pending');
+  // b71 (audit): requests from Vardum IDs that aren't pinned wait for Accept / Decline
+  const requests = rest.filter((s) => s.status === 'pending' && (s.request || s.incoming));
+  const waiting = rest.filter((s) => s.status === 'pending' && !s.request && !s.incoming);
   const ended = rest.filter((s) => s.status === 'ended');
 
   const renderRow = (s: SessionRow, i: number, all: SessionRow[]) => {
     const group = isGroupRow(s);
-    const online = !group && s.status === 'active' && !!s.peerSeenAt && Date.now() - s.peerSeenAt < 15000;
     return (
       <TouchableOpacity key={s.token} style={[styles.row, i === all.length - 1 && styles.rowLast]} onPress={() => onOpenSession(s.token)} disabled={busy}>
         <View style={[styles.avatar, group && styles.avatarGroup, s.status === 'pending' && styles.avatarPending, s.status === 'ended' && styles.avatarEnded]}>
-          <Text style={[styles.avatarText, s.status === 'ended' && styles.avatarTextEnded]}>{group ? '#' : s.title.slice(0, 2).toUpperCase()}</Text>
-          {online ? <View style={styles.onlineDot} /> : null}
+          <Text style={[styles.avatarText, s.status === 'ended' && styles.avatarTextEnded]}>{group ? '#' : titleInitials(s.title).toUpperCase()}</Text>
         </View>
         <View style={styles.rowBody}>
           <View style={styles.rowTop}>
-            <Text style={[styles.rowTitle, s.unread > 0 && styles.rowTitleUnread]} numberOfLines={1}>{s.title}</Text>
-            {s.verified ? <Text style={styles.verified}>✓</Text> : null}
+            <Text style={[styles.rowTitle, s.unread > 0 && styles.rowTitleUnread]} numberOfLines={1}>{isolateName(s.title)}</Text>
+            {/* b71 (audit): ✓ = the safety code was confirmed on THIS phone (never the server's flag) */}
+            {s.verified ? <Text style={styles.verified} accessibilityLabel="Safety code confirmed on this phone">✓</Text> : null}
           </View>
           <Text style={styles.rowSub} numberOfLines={1}>{s.subtitle}</Text>
         </View>
@@ -220,20 +216,6 @@ export function SessionsScreen({ sessions, busy, onRefresh, onOpenSession, onNew
             </TouchableOpacity>
           </View>
         ) : null}
-        {forumBannerVisible ? (
-          <View style={styles.forumBanner}>
-            <Text style={styles.forumBannerTitle}>⚡ The Founding Tester Forum is live — from Matt, your founder</Text>
-            <Text style={styles.forumBannerBody}>Big news: we've upgraded Vardum's security and moved to our own servers and relay. The Founding Tester Forum is where I'll be talking with you all directly — one tap to join, no invite link, end-to-end encrypted, history kept for 30 days. To use it you'll need to migrate over to the new native build — the upgrade only runs there. Come across, say hello — look forward to talking to you all. — Matt</Text>
-            <View style={styles.forumBannerActions}>
-              <TouchableOpacity style={styles.forumJoinBtn} onPress={onJoinForum} disabled={forumBannerBusy || busy}>
-                <Text style={styles.forumJoinBtnText}>{forumBannerBusy ? 'Joining…' : 'Join the forum →'}</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={onDismissForumBanner} disabled={forumBannerBusy}>
-                <Text style={styles.forumBannerDismiss}>Not now</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        ) : null}
         {welcomeVisible && onOpenWelcome ? (
           <View>
             <Text style={[styles.groupTitle, styles.groupTitleFirst]}>Start here</Text>
@@ -260,12 +242,13 @@ export function SessionsScreen({ sessions, busy, onRefresh, onOpenSession, onNew
             <Image source={require('../../assets/logo-mark.png')} style={styles.emptyLogo} resizeMode="contain" />
             <Text style={styles.emptyTitle}>No conversations yet</Text>
             <Text style={styles.emptyText}>
-              Tap ＋ New to message a contact or share an invite link. Messages are sealed with post-quantum keys that never leave this device.
+              Tap ＋ New to message a contact or share an invite link. Messages are encrypted on this phone, with post-quantum protection, before they are sent.
             </Text>
           </View>
         ) : (
           <>
             {section('Groups', groups)}
+            {section('Requests', requests, 'Open one to start the chat. Requests from IDs that aren’t in your contacts ask you to accept or decline first.')}
             {section('Chats', chats)}
             {section('Waiting to join', waiting, 'These open as soon as the other person accepts.')}
             {section('Ended', ended, 'No new messages can be sent here. Start a new chat from Contacts.')}
@@ -289,15 +272,6 @@ const styles = StyleSheet.create({
   pickerCancelTxt: { color: '#C9CFCE', fontSize: 14, fontWeight: '600' },
   avatarWelcome: { backgroundColor: '#24242D' },
   inviteCard: { borderWidth: 1, borderColor: '#3A3A44', borderRadius: 12, padding: 14, marginTop: 4, marginBottom: 6, backgroundColor: 'rgba(255,255,255,0.05)' },
-  // b198 (owner): the Founding Tester Forum banner in FLUORO BLUE — it is the
-  // home-page announcement and must be unmissable.
-  forumBanner: { borderWidth: 2, borderColor: '#FFFFFF', borderRadius: 12, padding: 14, marginTop: 4, marginBottom: 6, backgroundColor: 'rgba(255,255,255,0.12)' },
-  forumBannerTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '800', marginBottom: 6 },
-  forumBannerBody: { color: '#C9CFCE', fontSize: 12, lineHeight: 18, marginBottom: 10 },
-  forumBannerActions: { flexDirection: 'row', alignItems: 'center', gap: 14 },
-  forumJoinBtn: { backgroundColor: '#FFFFFF', borderRadius: 10, paddingVertical: 10, paddingHorizontal: 16 },
-  forumJoinBtnText: { color: '#0B0B0F', fontSize: 13, fontWeight: '800' },
-  forumBannerDismiss: { color: '#8E9696', fontSize: 12 },
   inviteTitle: { color: '#FFFFFF', fontSize: 14, fontWeight: '700', marginBottom: 6 },
   inviteText: { color: '#8E9696', fontSize: 12, lineHeight: 17, marginBottom: 10 },
   inviteBtn: { backgroundColor: '#FFFFFF', borderRadius: 11, paddingVertical: 11, alignItems: 'center', marginBottom: 8 },
@@ -312,8 +286,8 @@ const styles = StyleSheet.create({
   list: { paddingHorizontal: 16, paddingBottom: 32 },
   // b199 (owner device report, Oct 16): was `flex: 1`, which pinned the empty
   // state's content box to the screen height and centred inside it — with the
-  // forum banner + Getting started row above the empty state the content was
-  // taller than the screen, so centring pushed the banner's top under the
+  // Getting started row above the empty state the content was
+  // taller than the screen, so centring pushed the top under the
   // "Conversations" bar and "No conversations yet" off the bottom, and nothing
   // could scroll. flexGrow fills the screen when the content fits (still
   // centred) and grows + scrolls when it doesn't. Same side gutter as `list`.
@@ -335,7 +309,6 @@ const styles = StyleSheet.create({
   avatarEnded: { backgroundColor: '#15151B' },
   avatarText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   avatarTextEnded: { color: '#4A4A54' },
-  onlineDot: { position: 'absolute', right: -1, bottom: -1, width: 12, height: 12, borderRadius: 6, backgroundColor: '#FFFFFF', borderWidth: 2, borderColor: '#24242D' },
   rowBody: { flex: 1, minWidth: 0 },
   rowTop: { flexDirection: 'row', alignItems: 'center' },
   rowTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '600', flexShrink: 1, marginRight: 6 },

@@ -1,48 +1,65 @@
 /**
  * VEIL CallManager (b144, W3): the device-side glue that turns the tested
- * calls.ts core (L1 signaling + state machine + integrity monitor) into a
- * live audio call on react-native-webrtc.
+ * calls.ts core (signalling + state machine + integrity monitor) into a live
+ * audio call on react-native-webrtc. What it does:
  *
- * ARCHITECTURE (design S3, docs/encrypted-calls-design.md):
- *  L1  call setup/ICE/end signals ride the session's PQ-hybrid ratchet
- *      envelopes (sendCallSignal) — the relay sees only cipher-text.
- *  L2  media travels DTLS-SRTP inside WebRTC (transport encryption).
- *  L3  per-call fresh AES-GCM frame key travels inside L1 (CallFrameCrypto)
- *      — wired for the data-channel media path; the W1 spike rides the
- *      standard media path first (see W4 notes in the design doc).
+ *  SIGNALLING  offer / answer / ICE / ringing / end ride the chat session's
+ *      end-to-end encrypted ratchet (sendCallSignal) — the relay sees only
+ *      cipher-text. Each SDP carries its side's DTLS fingerprint, so the
+ *      fingerprint is authenticated by the chat session.
+ *  MEDIA  standard WebRTC DTLS-SRTP, keyed by the DTLS handshake (classical
+ *      ECDHE — the audio itself is NOT post-quantum). After applying the
+ *      peer's description, the fingerprint WebRTC holds is checked against
+ *      the one from the encrypted signalling (verifyAppliedRemoteSdp); when
+ *      connected, the certificate WebRTC reports is checked again if the
+ *      stats carry it. b71 (audit F-28): the first check compares two copies
+ *      of the same description, so the call card says "keys checked" only
+ *      once the live certificate itself matched (dtlsCertChecked).
+ *  There is no extra per-frame encryption layer.
  *
  * PRIVACY: calls go through VEIL's OWN TURN server (coturn on the VEIL VPS,
  * no third-party STUN/TURN). Short-lived credentials come from the relay
- * (veilTurnCredentials, see turnIce below) and the PC runs iceTransportPolicy
- * 'relay' — EVERY call is forced through TURN, so the two peers never learn
- * each other's IP addresses (each only sees the TURN server). Media stays
- * DTLS-SRTP end to end between the devices: TURN forwards encrypted packets
- * it cannot decrypt, so the server can't hear calls — it sees only that two
- * devices exchanged media, when, and roughly how much.
- * FALLBACK: if TURN is unavailable (relay not configured, offline, 4s
- * timeout) the call keeps the pre-TURN behaviour — no iceServers, host
- * candidates only — which connects on the same network only. A call never
- * fails just because TURN is down.
+ * (sealedTurn through the chat's own inbound, see turnIce below) and the PC always runs
+ * iceTransportPolicy 'relay', so the two peers never learn each other's IP
+ * addresses (each only sees the TURN server). Media stays DTLS-SRTP end to
+ * end between the devices: TURN forwards encrypted packets it cannot decrypt
+ * — it sees only that two devices exchanged media, when, and roughly how much.
+ * FAIL CLOSED: if TURN credentials can't be had (relay not configured,
+ * offline, 429, 4s timeout, malformed) NO peer connection is built and the
+ * call ends with "Couldn't reach the call relay — try again". As a second
+ * guard, every outgoing SDP and trickled candidate is scrubbed to relay
+ * candidates only, with this phone's own addresses removed (callGuards.ts).
  *
  * UI CONTRACT: CallManager is a module singleton. App configures it once
- * (relay/sessions/clientId closures), syncToken feeds it inbound signals,
- * CallOverlay subscribes to snapshots. No prop drilling, no navigation.
+ * (relay/sessions/clientId/storage closures), syncToken feeds it inbound
+ * signals, CallOverlay subscribes to snapshots. No prop drilling, no navigation.
  */
 import { Platform, Vibration } from 'react-native';
 import { requireOptionalNativeModule } from 'expo-modules-core';
 import { createIceBatcher, iceSignalBody, candsOf, type IceBatcher, candidateInSdp } from './iceBatch';
+import {
+  CALL_RELAY_UNREACHABLE, CALL_PEER_UNREACHABLE, relayOnlyPcConfig, scrubCandidateJson, scrubOutgoingSdp,
+  offerFreshness, SeenCallIds, remoteCertFingerprint, type CallKV, type TurnIce,
+  setTurnHostAllowList, PRODUCT_TURN_HOST_SUFFIXES, captureBeside /* b77u (U-M4) */
+} from './callGuards';
+// b75 round 2 (audit D2): TURN hosts must be under the product's own domains (a public name
+// can resolve to a LAN or loopback address); a TURN server on this machine only in development
+setTurnHostAllowList(PRODUCT_TURN_HOST_SUFFIXES, { devLoopback: typeof __DEV__ !== 'undefined' && __DEV__ === true });
 // b149: incoming-call ringtone. expo-av is already in the dev client (media
 // playback uses it), so Metro hot-reload can reach the native module.
 // Respects the hardware mute switch — silent mode stays silent (vibration
 // still runs); we deliberately do NOT set playsInSilentMode.
 import { Audio } from 'expo-av';
+import {
+  newTurnGrant, openTurnGrant, approveTurnGrant, awaitTurnGrant, turnGrantRefusal, type TurnGrantRelay,
+} from '../../vendor/device/src/sealed'; // b77n (audit VAR-04): TURN only for a call the other phone approved
 import ringAsset from '../../assets/veil-ring.wav';
 import ringbackAsset from '../../assets/veil-ringback.wav';
 import { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, mediaDevices, type MediaStream, type MediaStreamTrack } from 'react-native-webrtc';
 import {
   type CallSignal, type CallState, CallIntegrityMonitor, CallRefusedError,
-  newCallId, newCallSecretB64, processOffer, answerCall, endCall,
-  extractDtlsFingerprint, sendCallSignal,
+  newCallId, LEGACY_OFFER_K, processOffer, answerCall, endCall,
+  extractDtlsFingerprint, sendCallSignal, verifyAppliedRemoteSdp, verifyMediaFingerprint,
 } from '../../vendor/device/src/calls';
 import {
   encryptMessage, serializeRatchetState, deserializeRatchetState,
@@ -59,7 +76,13 @@ export interface CallSnapshot {
   startedAt: number | null;   // epoch ms, active only
   endedReason: string | null;
   muted: boolean;
-  integrity: 'ok' | 'amber' | 'red';
+  /** audit fix (b71): 'ok' / 'amber' only once THIS call's peer fingerprint
+   *  was checked against the encrypted signalling ('amber' = checked, but the
+   *  connection degraded); 'unchecked' = no check passed yet; 'red' = a check
+   *  failed. */
+  integrity: 'ok' | 'amber' | 'red' | 'unchecked';
+  /** b71 (audit F-28): the live DTLS certificate matched the signed fingerprint */
+  certChecked?: boolean;
   reach: 'pending' | 'ringing' | 'unreachable' | null; // 21 Oct 2026: caller side, has the other phone confirmed it rings?
 }
 
@@ -92,19 +115,40 @@ interface CallSession {
   firstCandAt?: number | null;     // when the first candidate arrived
   reach?: 'pending' | 'ringing' | 'unreachable'; // caller: the callee's ringing confirmation
   ackHandle?: ReturnType<typeof setTimeout> | null;
+  keysChecked?: boolean;           // audit fix (b71): applied remote fingerprint matched the signed one
+  dtlsCertChecked?: boolean;       // b71 (audit F-28): the live DTLS certificate matched it too
+  ringoutAt?: number;              // b71 (device test): when the ring window ends
+  ringAcked?: boolean;             // audit fix (b71): 'ringing' sent (only once the ring is on screen)
+  /** b77n (audit VAR-04): this call's TURN grant id — the caller opened it on its inbound and sent it
+   *  in the invite; the callee approves it on its own inbound as the call rings */
+  grant?: string;
+  invited?: boolean;               // caller: the invite went out (a failure after it sends 'end')
+  approval?: Promise<boolean> | null; // callee: the grant approval (prewarm starts it, answer reuses it)
+  /** audit VAR-09 (1f51): THIS call's grant is known approved — the callee's own approval went
+   *  through, or the caller redeemed it. Only then may a cached credential be reused. */
+  grantOk?: boolean;
+  noApproval?: boolean;            // b77n2 (review INFO): caller — the ring window ended without the other phone's approval
+  offerApplied?: Promise<void> | null; // callee: the offer being applied to the prewarmed connection
 }
 
 interface CallTransport {
   relay: () => unknown;
   sessions: () => unknown;
   clientId: () => Promise<string | null>;
+  /** audit fix (b71): where the seen-call-id list persists. Optional: without
+   *  it the list lives in memory only (the 60 s time check still holds). */
+  storage?: () => CallKV | null | undefined;
 }
 
 let transport: CallTransport | null = null;
 let session: CallSession | null = null;
 const listeners = new Set<(s: CallSnapshot | null) => void>();
 
-const IDLE_CORE: CallState = { callId: '', phase: 'idle', offerFingerprint: null, l3SecretB64: null, seqSeen: -1 };
+const IDLE_CORE: CallState = { callId: '', phase: 'idle', offerFingerprint: null, seqSeen: -1 };
+
+// audit fix (b71): every call id this phone rang or refused, so a replayed
+// offer never rings (persisted through transport.storage when App gives it).
+const seenCalls = new SeenCallIds(() => transport?.storage?.() ?? null);
 
 const RING_PATTERN = [0, 600, 800] as number[];
 
@@ -215,7 +259,7 @@ async function startRingback(s: CallSession): Promise<void> {
 async function stopRingback(): Promise<void> {
   try { await ringbackSound?.stopAsync(); } catch { /* already stopped */ }
 }
-const RINGOUT_MS = 45_000; // unanswered ring dies (both directions)
+const RINGOUT_MS = 60_000; // unanswered ring dies (both directions); b71: 60 s — a locked phone takes up to ~20 s to see the offer, then needs time to unlock
 // b151 FIX (live-found, owner repro Oct 1): phase was flipping to 'active'
 // the moment the answer SDP was sent/received — pure signaling, no proof
 // the actual P2P media path ever connected. The owner saw native show
@@ -237,9 +281,17 @@ function snapshot(): CallSnapshot | null {
     startedAt: session.startedAt,
     endedReason: session.endedReason,
     muted: session.muted,
-    integrity: session.monitor.status(),
+    integrity: integrityOf(session),
+    certChecked: !!session.dtlsCertChecked, // b71 (audit F-28)
     reach: session.reach ?? null,
   };
+}
+
+function integrityOf(s: CallSession): CallSnapshot['integrity'] {
+  const st = s.monitor.status();
+  if (st === 'red') return 'red';
+  if (!s.keysChecked) return 'unchecked';
+  return st;
 }
 
 function notify(): void {
@@ -249,6 +301,8 @@ function notify(): void {
 
 // b146: pre-offer ICE buffer — 10s TTL, swept on each offer handling pass.
 const preOfferIce = new Map<string, CallSignal[]>();
+/** audit fix (b71): early candidates are held per chat AND call id. */
+const iceKey = (token: string, callId: string) => `${token}|${callId}`;
 setInterval(() => {
   // candidates older than 10s without an offer are dead; the window is
   // bounded by the relay's fetch cadence anyway.
@@ -332,9 +386,40 @@ async function waitGathered(s: CallSession, ms: number): Promise<void> {
   }
 }
 
-/** The local SDP as it is now (with the gathered candidates), or the fallback. */
+/** The local SDP as it is now (with the gathered candidates), or the
+ *  fallback — scrubbed to relay candidates with no address of this phone
+ *  (audit fix b71; the connection itself is relay-only too). */
 function localSdp(pc: RTCPeerConnection, fallback: string): string {
-  return (pc as unknown as { localDescription?: { sdp?: string } | null }).localDescription?.sdp || fallback;
+  return scrubOutgoingSdp((pc as unknown as { localDescription?: { sdp?: string } | null }).localDescription?.sdp || fallback);
+}
+
+/** audit fix (b71): the remote description the connection now HOLDS must
+ *  carry the fingerprint the peer sent inside the encrypted offer/answer.
+ *  Pass = keys checked for this call; fail = red, and the call ends. */
+function checkAppliedRemote(s: CallSession, pc: RTCPeerConnection): boolean {
+  const applied = (pc as unknown as { remoteDescription?: { sdp?: string } | null }).remoteDescription?.sdp;
+  if (verifyAppliedRemoteSdp(s.core, applied, s.monitor)) {
+    s.keysChecked = true;
+    return true;
+  }
+  s.keysChecked = false;
+  console.log('[veil-call] applied remote fingerprint differs from the signed one — ending the call');
+  teardown(s, 'security check failed', true);
+  return false;
+}
+
+/** audit fix (b71): once connected, the DTLS certificate WebRTC reports for
+ *  the peer (when the stats carry it) must match too. Silent when the stats
+ *  have no certificate entry; a mismatch ends the call. */
+async function checkDtlsCert(s: CallSession, pc: RTCPeerConnection): Promise<void> {
+  try {
+    const report = (await pc.getStats()) as unknown as Map<string, Record<string, unknown>>;
+    const fp = remoteCertFingerprint(report.values());
+    if (!fp || callGone(s)) return;
+    if (verifyMediaFingerprint(s.core, fp, s.monitor)) { s.dtlsCertChecked = true; notify(); console.log('[veil-call] DTLS certificate matches the signed fingerprint'); return; }
+    s.keysChecked = false;
+    teardown(s, 'security check failed', true);
+  } catch { /* stats shapes vary; the applied-description check already ran */ }
 }
 
 /** Start trickling: send held candidates the SDP didn't already carry. */
@@ -352,7 +437,7 @@ function releaseHeldIce(s: CallSession, sdp: string): void {
 // "Calling…" with no tone; with no confirmation in 20 s, "Not reachable yet".
 // Older builds never confirm, so the call keeps going to the ringout until
 // they're gone; then REQUIRE_RING_ACK ends it at 20 s.
-const RING_ACK_MS = 20_000;
+const RING_ACK_MS = 35_000; // b71: a locked phone polls every ~10-20 s
 const REQUIRE_RING_ACK = false;
 
 function armRingAck(s: CallSession): void {
@@ -379,12 +464,22 @@ async function signal(token: string, sig: CallSignal): Promise<void> {
   );
 }
 
-function armRingout(s: CallSession): void {
+/** b71 (device test): once the other phone says it is ringing, it gets at least this
+ *  long to answer — a locked phone can start ringing well into the ring window (it
+ *  polls every ~20 s) and then still has to be unlocked */
+const RING_AFTER_ACK_MS = 45_000;
+
+function armRingout(s: CallSession, ms: number = RINGOUT_MS): void {
+  if (s.timeoutHandle !== null) clearTimeout(s.timeoutHandle);
+  s.ringoutAt = Date.now() + ms;
   s.timeoutHandle = setTimeout(() => {
     const wasRingingCallee = s.role === 'callee';
-    teardown(s, s.role === 'caller' ? 'no answer' : 'missed', true);
+    // b77n2 (review INFO): a caller whose call the other phone neither confirmed ringing nor approved never
+    // reached it — "no answer" claimed it rang
+    const reached = s.reach === 'ringing' || !!s.pc;
+    teardown(s, s.role === 'caller' ? (reached ? 'no answer' : CALL_PEER_UNREACHABLE) : 'missed', true);
     if (wasRingingCallee) recordMissed(s.callId, s.token, s.peerLabel); // b157
-  }, RINGOUT_MS);
+  }, ms);
 }
 
 /** b151: signaling is done (answer sent/received) but the real media path
@@ -418,17 +513,103 @@ function markConnected(s: CallSession): void {
 
 // TURN credentials (relay-only internet calling). The VEIL relay mints
 // short-lived coturn credentials (TURN REST scheme: username =
-// "<expiry-epoch-seconds>:<id>") via veilTurnCredentials; cached until 5
-// minutes before expiry. ANY failure — 503 (not configured), 401, network,
-// 4s timeout, malformed body — resolves to null and the call keeps the
-// host-only behaviour. Never log username/credential.
-interface TurnIce {
-  iceServers: { urls: string[]; username: string; credential: string }[];
-}
-type TurnInvoker = { invoke(fn: string, payload: Record<string, unknown>): Promise<{ data: unknown; status: number }> };
+// "<expiry-epoch-seconds>:<id>") via the chat's sealedTurn (b77; b77r1: only that); cached until 5
+// minutes before expiry. ANY failure — 503 (not configured), 401, 429,
+// network, 4s timeout, malformed body — resolves to null, and a null means
+// NO call (fail closed: a connection without relay servers would hand the
+// peer this phone's LAN / IPv6 addresses). Never log username/credential.
+// b77n (audit VAR-04): sealedTurn answers only for the call's TURN GRANT, which the caller opened
+// on its own inbound (turnGrant) and the callee's phone approved on ITS own inbound as the call rang
+// (turnApprove). So the caller gets credentials only after the callee's phone rings: start() sends
+// the invite first, waits for the approval (asking about once a second), and only then builds its
+// connection and sends the offer. Spec §12.12.
+type TurnInvoker = TurnGrantRelay & {
+  invoke(fn: string, payload: Record<string, unknown>): Promise<{ data: unknown; status: number }>;
+};
 const TURN_FETCH_TIMEOUT_MS = 4_000;
+/** b77n: the callee asks for its credentials right after approving; a few seconds of "pending"
+ *  (the approval still landing) are waited out */
+const CALLEE_TURN_WAIT_MS = 8_000;
+/** b77n: Accept tapped before the caller's offer arrived (the caller sends it once the approval is
+ *  in): how long answer() waits for it */
+const OFFER_WAIT_MS = 20_000;
+
+function withTurnTimeout<T>(p: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), TURN_FETCH_TIMEOUT_MS); });
+  return Promise.race([p, timeout]).finally(() => { if (timer !== null) clearTimeout(timer); });
+}
+/** the relay's grant routes, each call bounded by TURN_FETCH_TIMEOUT_MS */
+function grantRelay(): TurnGrantRelay | null {
+  const relay = transport?.relay() as TurnInvoker | null | undefined;
+  if (!relay || typeof relay.sealedTurn !== 'function' || typeof relay.turnGrant !== 'function' || typeof relay.turnApprove !== 'function') return null;
+  return {
+    turnGrant: (m, r, g) => withTurnTimeout(relay.turnGrant!(m, r, g)),
+    turnApprove: (m, r, g) => withTurnTimeout(relay.turnApprove!(m, r, g)),
+    sealedTurn: (m, r, g) => withTurnTimeout(relay.sealedTurn!(m, r, g)),
+  };
+}
+const grantSessions = () => transport?.sessions() as { load: (t: string) => Promise<unknown> } | null | undefined;
+
+/** b77n2 (review L1): the wait before re-trying a grant open that failed transiently (doubled the second time) */
+const OPEN_GRANT_RETRY_MS = 700;
+/** b77n: the caller opens this call's grant on its own inbound (before the invite goes out).
+ *  Throws NoRelayError when it can't (nothing has been sent yet). */
+async function openGrant(s: CallSession): Promise<void> {
+  try {
+    const relay = grantRelay(), sess = grantSessions();
+    if (!relay || !sess?.load) throw new Error('relay not ready');
+    // b77n2 (review L1): a transient failure (a timeout — the answer may have been lost after the relay
+    // stored the grant —, a 5xx, a 429) is tried again twice; the relay answers OK to the same opener
+    // re-opening its own grant. A refusal (400 / 403 / 410) is final.
+    for (let attempt = 0; ; attempt++) {
+      try { await openTurnGrant(relay, sess as never, s.token, s.grant as string); break; }
+      catch (e) {
+        if (attempt >= 2 || turnGrantRefusal(e) || callGone(s)) throw e;
+        console.log(`[veil-call] call grant open failed (${(e as Error)?.message ?? e}) — trying again`);
+        await new Promise((r) => setTimeout(r, OPEN_GRANT_RETRY_MS * (attempt + 1)));
+      }
+    }
+  } catch (e) {
+    console.log(`[veil-call] call grant not opened (${(e as Error)?.message ?? e}) — no call without the relay`);
+    throw new NoRelayError();
+  }
+}
+
+/** b77n: the callee approves the caller's grant on its own inbound — once per call (memoized; one
+ *  retry). Without it neither phone gets relay credentials. */
+function approveCall(s: CallSession): Promise<boolean> {
+  if (s.approval) return s.approval;
+  const once = async (): Promise<boolean> => {
+    const relay = grantRelay(), sess = grantSessions();
+    if (!relay || !sess?.load || !s.grant) throw new Error('relay not ready');
+    await approveTurnGrant(relay, sess as never, s.token, s.grant);
+    s.grantOk = true; // audit VAR-09: approved for this call
+    return true;
+  };
+  s.approval = (async () => {
+    try { return await once(); } catch (e) {
+      console.log(`[veil-call] call approval failed (${(e as Error)?.message ?? e}) — one retry`);
+      await new Promise((r) => setTimeout(r, 1500));
+      if (callGone(s)) return false;
+      try { return await once(); } catch (e2) {
+        console.log(`[veil-call] call approval failed again (${(e2 as Error)?.message ?? e2})`);
+        s.approval = null; // answer() may try once more
+        return false;
+      }
+    }
+  })();
+  return s.approval;
+}
 const TURN_REFRESH_MARGIN_MS = 5 * 60_000;
-let turnCache: { ice: TurnIce; expiresAt: number } | null = null;
+/** b77r1 (audit A-6): keyed by the chat the credentials were fetched for (through that chat's
+ *  verified inbound) — they are never handed to a call in another chat.
+ *  audit VAR-09 (1f51): and only to a call whose OWN grant is approved (canReuseTurn) — a re-dial
+ *  never skips the per-call approval. */
+let turnCache: { ice: TurnIce; expiresAt: number; token: string } | null = null;
+/** b75 round 3 (audit DV-10): bumped by every wipe (forgetAfterWipe). A credential fetch that
+ *  was in flight when a wipe began neither fills the cache nor returns credentials after it. */
+let turnEra = 0;
 
 function parseTurn(data: unknown): { ice: TurnIce; expiresAt: number } | null {
   const raw = (data as { iceServers?: unknown } | null)?.iceServers;
@@ -438,6 +619,7 @@ function parseTurn(data: unknown): { ice: TurnIce; expiresAt: number } | null {
   for (const e of raw as { urls?: unknown; username?: unknown; credential?: unknown }[]) {
     const urls = typeof e?.urls === 'string' ? [e.urls] : e?.urls;
     if (!Array.isArray(urls) || urls.length === 0 || !urls.every((u) => typeof u === 'string')) return null;
+    if (!urls.every((u) => /^turns?:/i.test(u as string))) return null; // relay servers only, never STUN
     if (typeof e.username !== 'string' || typeof e.credential !== 'string') return null;
     const exp = Number(e.username.split(':')[0]);
     if (!Number.isFinite(exp) || exp <= 0) return null;
@@ -447,41 +629,75 @@ function parseTurn(data: unknown): { ice: TurnIce; expiresAt: number } | null {
   return { ice: { iceServers: servers }, expiresAt };
 }
 
-/** TURN credentials for this call, or null (host-only fallback). */
-async function turnIce(): Promise<TurnIce | null> {
-  if (turnCache && turnCache.expiresAt - TURN_REFRESH_MARGIN_MS > Date.now()) {
+/** audit VAR-09 (1f51): a cached credential is handed out only for the same chat, while fresh,
+ *  and only once THIS call's grant is approved (the callee approved it itself; a caller learns
+ *  it only by redeeming the grant, so a caller never skips the wait). */
+export function canReuseTurn(
+  cache: { expiresAt: number; token: string } | null,
+  call: { token: string; grantOk?: boolean },
+  now: number,
+): boolean {
+  return !!cache && !!call.token && cache.token === call.token && call.grantOk === true
+    && cache.expiresAt - TURN_REFRESH_MARGIN_MS > now;
+}
+
+/** TURN credentials for this call, or null (the call must not go ahead).
+ *  b77n (audit VAR-04): redeemed through this call's grant (s.grant). The caller (waitForApproval)
+ *  asks again about once a second until the callee's phone has approved it, up to the ring window;
+ *  the callee asks right after its own approval. A credential cached for this chat (fetched for an
+ *  earlier call, until 5 minutes before it expires) is used without asking only once this call's
+ *  grant is approved (audit VAR-09: canReuseTurn). */
+async function turnIce(s: CallSession, waitForApproval = false): Promise<TurnIce | null> {
+  const tok = s.token;
+  if (turnCache && tok && turnCache.token === tok && canReuseTurn(turnCache, s, Date.now())) {
     console.log(`[veil-call] turn: cache hit, ${turnCache.ice.iceServers.length} server(s), relay-only`);
     return turnCache.ice;
   }
-  turnCache = null;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  const era = turnEra; // b75 round 3 (audit DV-10)
   try {
-    const relay = transport?.relay() as TurnInvoker | null | undefined;
-    if (!relay || typeof relay.invoke !== 'function') throw new Error('relay not ready');
-    const timeout = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('timeout')), TURN_FETCH_TIMEOUT_MS); });
-    const res = await Promise.race([relay.invoke('veilTurnCredentials', {}), timeout]);
-    const got = parseTurn(res.data);
-    if (!got) throw new Error('malformed credentials');
+    const relay = grantRelay();
+    if (!relay) throw new Error('relay not ready');
+    // b77 (sealed sender): the call's chat asks through its own inbound (sealedTurn, read cap) — no
+    // login, no account. b77r1 (audit A-6): no fallback to the logged-in account route any more. A
+    // chat without delivery capabilities (none can call: they predate b77) gets no credentials: no call.
+    if (!tok) throw new Error('no chat for this call');
+    if (!s.grant) throw new Error('no call grant');
+    const sess = grantSessions();
+    if (!sess?.load) throw new Error('relay not ready');
+    const calleeUntil = Date.now() + CALLEE_TURN_WAIT_MS;
+    // the caller waits as long as the call rings (a 'ringing' confirmation can extend the window)
+    const deadline = waitForApproval ? () => s.ringoutAt ?? 0 : calleeUntil;
+    const data = await awaitTurnGrant(relay, sess as never, tok, s.grant, { alive: () => !callGone(s), deadline });
+    if (data === null && !callGone(s)) s.noApproval = true; // b77n2 (review INFO): not the relay's fault
+    if (data === null) throw new Error(callGone(s) ? 'the call ended meanwhile' : 'the other phone has not approved the call');
+    s.grantOk = true; // audit VAR-09: the relay issued credentials for this grant, so it was approved
+    const parsed = parseTurn(data);
+    if (!parsed) throw new Error('malformed credentials');
+    const got = { ...parsed, token: tok };
     if (got.expiresAt - TURN_REFRESH_MARGIN_MS <= Date.now()) throw new Error('credentials already near expiry');
+    if (era !== turnEra) throw new Error('a wipe happened meanwhile'); // b75 round 3 (audit DV-10)
     turnCache = got;
     console.log(`[veil-call] turn: ${got.ice.iceServers.length} server(s), relay-only`);
     return got.ice;
   } catch (e) {
-    console.log(`[veil-call] turn unavailable (${(e as Error)?.message ?? e}) — same-network only`);
+    console.log(`[veil-call] turn unavailable (${(e as Error)?.message ?? e}) — no call without the relay`);
     return null;
-  } finally {
-    if (timer !== null) clearTimeout(timer);
   }
 }
 
+/** Thrown when no TURN relay is available: the call ends with this text. */
+class NoRelayError extends Error {
+  constructor() { super(CALL_RELAY_UNREACHABLE); }
+}
+
 async function makePc(s: CallSession, ice: TurnIce | null): Promise<RTCPeerConnection> {
-  // Relay-only through VEIL's own TURN when credentials were obtained,
-  // otherwise the pre-TURN host-only config (privacy note in the header).
-  // iceCandidatePoolSize (20 Oct 2026): start the relay allocations as soon as
-  // the connection exists, so they're ready by the time the offer/answer is set.
-  const pc = ice
-    ? new RTCPeerConnection({ iceServers: ice.iceServers, iceTransportPolicy: 'relay', iceCandidatePoolSize: 1 } as never)
-    : new RTCPeerConnection({ iceServers: [] });
+  // audit fix (b71): relay-only through VEIL's own TURN, ALWAYS. No relay
+  // servers = no connection (the old host-only fallback leaked LAN IPv4 and
+  // global IPv6 host candidates to the peer). iceCandidatePoolSize (20 Oct
+  // 2026): relay allocations start as soon as the connection exists.
+  const config = relayOnlyPcConfig(ice);
+  if (!config) throw new NoRelayError();
+  const pc = new RTCPeerConnection(config as never);
   // rn-webrtc extends event-target-shim whose generics don't resolve under
   // bundler moduleResolution — the listeners are structurally sound at
   // runtime, so a narrow structural cast keeps tsc green without weakening
@@ -508,8 +724,10 @@ async function makePc(s: CallSession, ice: TurnIce | null): Promise<RTCPeerConne
   s.iceBatcher = batcher;
   pcEv.addEventListener('icecandidate', (e) => {
     if (!e.candidate) { s.gathered = true; if (s.iceRelease) batcher.flush(); return; } // null candidate = end-of-gathering
+    // audit fix (b71): only relay candidates leave the phone, related address zeroed
+    const cand = scrubCandidateJson(JSON.stringify({ candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid ?? null, sdpMLineIndex: e.candidate.sdpMLineIndex ?? null }));
+    if (!cand) return;
     s.firstCandAt = s.firstCandAt ?? Date.now();
-    const cand = JSON.stringify({ candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid ?? null, sdpMLineIndex: e.candidate.sdpMLineIndex ?? null });
     // a prewarmed callee holds its candidates until the call is accepted
     if (s.iceRelease) batcher.push(cand); else s.heldIce.push(cand);
   });
@@ -517,9 +735,8 @@ async function makePc(s: CallSession, ice: TurnIce | null): Promise<RTCPeerConne
     const st = pc.connectionState;
     console.log(`[veil-call] connection: ${st} (role ${s.role}, phase ${s.phase})`);
     // b151: this is the real signal — the only trustworthy "it's actually
-    // live" event for either side (on the host-only fallback, cross-network
-    // pairs correctly keep showing "Connecting…" — there is no path).
-    if (st === 'connected') { s.mediaUp = true; markConnected(s); void logPath(pc); return; }
+    // live" event for either side.
+    if (st === 'connected') { s.mediaUp = true; markConnected(s); void logPath(pc); void checkDtlsCert(s, pc); return; }
     if (st === 'disconnected' || st === 'failed' || st === 'closed') s.mediaUp = false;
     if (st === 'failed') {
       s.monitor.record('degraded', 'media path failed to establish');
@@ -539,22 +756,45 @@ async function makePc(s: CallSession, ice: TurnIce | null): Promise<RTCPeerConne
  *  to build it the old way. */
 async function prewarm(s: CallSession): Promise<void> {
   try {
-    const ice = await turnIce();
+    // b77n (audit VAR-04): approve the caller's grant first — the caller gets its relay credentials
+    // (and sends the offer) only after this; then this phone's own credentials through the same grant
+    if (!(await approveCall(s))) return;
+    if (session !== s || s.phase !== 'ringing' || s.pc) return;
+    const ice = await turnIce(s);
     if (session !== s || s.phase !== 'ringing' || s.pc) return;
     const pc = await makePc(s, ice);
     if (session !== s || s.phase !== 'ringing') { try { pc.close(); } catch { /* closed */ } return; }
     s.pc = pc;
-    const offer = s.pendingOfferSdp;
-    if (offer) {
-      await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer }) as never);
-      for (const c of s.pendingIce) await addIce(pc, c).catch(() => undefined);
-      s.pendingIce = [];
-    }
+    await applyPrewarmOffer(s); // b77n: the offer may not be here yet; it is applied when it comes
   } catch (e) {
     console.log(`[veil-call] prewarm skipped: ${(e as Error).message}`);
     try { s.pc?.close(); } catch { /* closed */ }
     s.pc = null;
   }
+}
+
+/** b77n: the caller's offer applied to the prewarmed connection (once; when the offer and the
+ *  connection both exist — whichever came second calls this) */
+function applyPrewarmOffer(s: CallSession): Promise<void> {
+  if (s.offerApplied) return s.offerApplied;
+  const pc = s.pc, offer = s.pendingOfferSdp;
+  if (!pc || !offer || s.answering) return Promise.resolve();
+  s.offerApplied = (async () => {
+    try {
+      if (!(pc as unknown as { remoteDescription?: unknown }).remoteDescription) {
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer }) as never);
+      }
+      for (const c of s.pendingIce) await addIce(pc, c).catch(() => undefined);
+      s.pendingIce = [];
+    } catch (e) { console.log(`[veil-call] prewarm offer not applied: ${(e as Error).message}`); }
+  })();
+  return s.offerApplied;
+}
+
+/** b77n: Accept came before the caller's offer — wait for it (or the call ending, or OFFER_WAIT_MS) */
+async function waitOffer(s: CallSession, ms: number): Promise<void> {
+  const until = Date.now() + ms;
+  while (!s.pendingOfferSdp && Date.now() < until && !callGone(s)) await new Promise((r) => setTimeout(r, 50));
 }
 
 /** Which path the call took (relay vs host) — candidate types only, never
@@ -596,6 +836,17 @@ export const CallManager = {
   /** App wires this once the session context exists (App.tsx). */
   configure(t: CallTransport): void { transport = t; },
 
+  /** b75 (audit DEV-L4): every wipe forgets what this module holds in memory: the
+   *  cached TURN credentials, the seen-call ids and the calls ended here (a wipe used
+   *  to leave them for the rest of the run) */
+  forgetAfterWipe(): void {
+    turnEra++; // b75 round 3 (audit DV-10): a fetch in flight can't fill the cache after this
+    turnCache = null;
+    seenCalls.forget();
+    locallyEndedCalls.clear();
+    recordedMisses.clear();
+  },
+
   subscribe(l: (s: CallSnapshot | null) => void): () => void {
     listeners.add(l);
     l(snapshot());
@@ -616,16 +867,32 @@ export const CallManager = {
       pc: null, local: null, pendingIce: [], pendingOfferSdp: null, startedAt: null, endedReason: null,
       muted: false, seq: 1, ringVib: null, timeoutHandle: null, mediaUp: false,
       iceBatcher: null, iceRelease: false, heldIce: [], prewarming: null, reach: 'pending',
+      grant: newTurnGrant(), // b77n (audit VAR-04): fresh per call attempt
     };
     session = s;
     notify();
     armRingout(s);
     let local: CallSession['local'] = null, pc: CallSession['pc'] = null, audioOn = false;
     try {
-      const [mic, ice] = await Promise.all([captureMic(), turnIce()]);
+      // b77n (audit VAR-04): the grant is opened on this phone's inbound before anything is sent
+      // b77u (audit 6 U-M4 / R1 F-04): the stream is ours (and stopped by any later abandon) the moment it arrives;
+      // a failed grant stops it
+      const mic = await captureBeside(captureMic(), openGrant(s), (m) => { local = m; });
       local = mic;
-      if (callGone(s)) { abandon(s, local, pc, audioOn); return; } // hung up during the mic prompt / TURN
+      if (callGone(s)) { abandon(s, local, pc, audioOn); return; } // hung up during the mic prompt
       s.local = local;
+      // b77n: the INVITE rings the other phone (and wakes it: notify 'call') and carries the grant;
+      // the other phone approves the grant as it rings. The ring window counts from here.
+      await signal(token, { __veil_call: 1, op: 'invite', call_id: callId, seq: s.seq, grant: s.grant });
+      s.invited = true;
+      if (callGone(s)) { abandon(s, local, pc, audioOn); return; }
+      armRingout(s);
+      armRingAck(s); // the ringing tone waits for the callee's confirmation
+      notify();
+      // relay credentials only once the other phone approved this call (or one cached for this chat)
+      const ice = await turnIce(s, true);
+      if (callGone(s)) { abandon(s, local, pc, audioOn); return; } // hung up / rang out while waiting
+      if (!relayOnlyPcConfig(ice)) throw new NoRelayError(); // audit fix (b71): fail closed, no offer sent
       callAudioMode(true); // Android call mode: echo cancellation + earpiece/headset
       audioOn = true;
       pc = await makePc(s, ice);
@@ -640,22 +907,30 @@ export const CallManager = {
       await signal(token, {
         __veil_call: 1, op: 'offer', call_id: callId, seq: s.seq,
         sdp: offerSdp,
-        k: newCallSecretB64(),
+        k: LEGACY_OFFER_K, // not a key: older builds refuse an offer without the field
       });
       if (callGone(s)) return; // teardown already closed what s holds
       releaseHeldIce(s, offerSdp);
-      armRingAck(s); // the ringing tone waits for the callee's confirmation
+      // b71 (device test): the ring window counts from the call reaching the other phone — b77n:
+      // the invite (armed above, after it went out), not the tap: the mic prompt and a slow phone's
+      // set-up ate half of it, and the other phone rang for only ~30 s
       notify();
     } catch (e) {
       if (callGone(s)) { abandon(s, local, pc, audioOn); return; }
-      teardown(s, 'could not start the call', false);
+      // b77n: once the invite went out the other phone rings — it is told the call ended
+      // b77n2 (review INFO): the ring window ended with no approval from the other phone — say so, not "the relay"
+      if (e instanceof NoRelayError) { teardown(s, s.noApproval ? CALL_PEER_UNREACHABLE : CALL_RELAY_UNREACHABLE, s.invited === true); return; } // shown on the call card
+      teardown(s, 'could not start the call', s.invited === true);
       throw e;
     }
   },
 
   /** Callee accepted the ring. */
-  async answer(): Promise<void> {
+  // callId (audit fix b71): the call the tapped screen showed — a tap never
+  // answers a different call that replaced it.
+  async answer(callId?: string): Promise<void> {
     const s = session;
+    if (callId !== undefined && s?.callId !== callId) return;
     // b64 test (C-5, live-found 21 Oct): on a slow network the first Accept
     // takes seconds; a second tap re-ran the answer on the same connection,
     // which failed and ended the call. Only the first tap counts.
@@ -665,13 +940,19 @@ export const CallManager = {
     let local: CallSession['local'] = null, pc: CallSession['pc'] = null, audioOn = false;
     try {
       // 20 Oct 2026: let a prewarm that's still running finish, then reuse it
-      const [mic] = await Promise.all([captureMic(), s.prewarming ?? Promise.resolve()]);
+      const mic = await captureBeside(captureMic(), s.prewarming ?? Promise.resolve(), (m) => { local = m; }); // b77u (audit 6 U-M4)
       local = mic;
       if (callGone(s)) { abandon(s, local, pc, audioOn); return; } // the caller hung up meanwhile
       s.local = local;
+      // b77n (audit VAR-04): the caller sends its offer once this phone approved the grant (prewarm
+      // did that as the call rang); an Accept that beat the offer waits for it
+      if (!s.pc && !(await approveCall(s))) throw new NoRelayError();
+      if (!s.pendingOfferSdp) await waitOffer(s, OFFER_WAIT_MS);
+      if (callGone(s)) { abandon(s, local, pc, audioOn); return; }
       callAudioMode(true); // Android call mode: echo cancellation + earpiece/headset
       audioOn = true;
-      pc = s.pc ?? await makePc(s, await turnIce());
+      await (s.offerApplied ?? Promise.resolve()); // b77n: a prewarm offer apply still running
+      pc = s.pc ?? await makePc(s, await turnIce(s));
       if (callGone(s)) { abandon(s, local, pc, audioOn); return; }
       s.pc = pc;
       attachMic(pc, s.local);
@@ -680,6 +961,7 @@ export const CallManager = {
       if (!(pc as unknown as { remoteDescription?: unknown }).remoteDescription) {
         await pc.setRemoteDescription(new RTCSessionDescription({ type: 'offer', sdp: offer }) as never);
       }
+      if (!checkAppliedRemote(s, pc)) return; // audit fix (b71): ended, nothing answered
       // flush ICE that arrived before the remote description existed
       for (const ice of s.pendingIce) await addIce(pc, ice);
       s.pendingIce = [];
@@ -700,22 +982,56 @@ export const CallManager = {
     } catch (e) {
       console.log(`[veil-call] answer failed: ${(e as Error).message}`);
       if (callGone(s)) { abandon(s, local, pc, audioOn); return; }
-      teardown(s, 'call failed to connect', true);
+      teardown(s, e instanceof NoRelayError ? CALL_RELAY_UNREACHABLE : 'call failed to connect', true);
     }
   },
 
   /** Callee declined. */
-  decline(): void {
+  decline(callId?: string): void { // callId: as for answer
     const s = session;
+    if (callId !== undefined && s?.callId !== callId) return;
     if (!s || s.phase !== 'ringing' || s.role !== 'callee') return;
     teardown(s, 'declined', true);
   },
 
-  /** Either side hangs up. */
-  hangup(): void {
+  /** Either side hangs up. No callId = whatever call is live (wipes, decoy). */
+  hangup(callId?: string): void {
     const s = session;
+    if (callId !== undefined && s?.callId !== callId) return;
     if (!s || s.phase === 'ended') return;
     teardown(s, 'hangup', true);
+  },
+
+  /** audit fix (b71): the ring is on screen (CallOverlay calls this while the
+   *  app is in front). Only now does the caller hear "Ringing…" — an offer
+   *  that rang nowhere visible never confirms. Once per call. */
+  ringShown(callId: string): void {
+    const s = session;
+    if (!s || s.callId !== callId || s.role !== 'callee' || s.phase !== 'ringing' || s.ringAcked) return;
+    s.ringAcked = true;
+    // audit VAR-09 (1f51): the grant approval and the relay allocations start only now that the
+    // ring is on screen (20 Oct 2026 prewarm, moved from the invite's receipt)
+    if (!s.prewarming && !s.pc && !s.answering) s.prewarming = prewarm(s);
+    void signal(s.token, { __veil_call: 1, op: 'ringing', call_id: s.callId })
+      .catch((e: Error) => console.log(`[veil-call] ringing confirmation not sent: ${e.message}`));
+  },
+
+  /** audit fix (b71), lock screen: is a call ringing or holding the mic? No
+   *  name or token, so it is safe to show under the lock. */
+  lockScreenCall(): { phase: CallUiPhase; callId: string; incoming: boolean } | null {
+    const s = session;
+    if (!s || s.phase === 'ended') return null;
+    // b71 (device test): enough for the lock screen to show "incoming — unlock to answer"
+    // (still no name or chat)
+    return { phase: s.phase, callId: s.callId, incoming: s.role === 'callee' && s.phase === 'ringing' };
+  },
+
+  /** audit fix (b71), lock screen: end whatever call is live — the lock
+   *  screen's "End call" control, or App ending calls as it locks. */
+  endFromLock(): void {
+    const s = session;
+    if (!s || s.phase === 'ended') return;
+    teardown(s, s.role === 'callee' && s.phase === 'ringing' ? 'declined' : 'ended on the lock screen', true);
   },
 
   /** b157: set by App — receives (threadToken, peerLabel) exactly once per
@@ -740,7 +1056,9 @@ export const CallManager = {
     // never ring a dead call.
     const ended = new Set(sigs.filter((x) => x.op === 'end').map((x) => x.call_id));
     for (const sig of sigs) {
-      if (sig.op === 'offer' && ended.has(sig.call_id)) {
+      // b77n (audit VAR-04): the invite is what rings (it was the offer)
+      if (sig.op === 'invite' && ended.has(sig.call_id)) {
+        await seenCalls.add(sig.call_id); // audit fix (b71): a later replay of it never rings
         recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact');
         continue;
       }
@@ -753,60 +1071,100 @@ export const CallManager = {
     console.log(`[veil-call] signal in: ${sig.op} (this call ${s?.callId === sig.call_id ? 'yes' : 'no'}, phase ${s?.phase ?? 'none'})`);
     switch (sig.op) {
       case 'offer': {
-        if (s && s.phase === 'ringing' && s.callId !== sig.call_id) {
-          // b63 review (C-4): a newer call replaces one still ringing; end the
-          // old one properly (its connection, timers, and its caller's ring)
-          teardown(s, 'replaced by a newer call', true);
-        }
-        if (s && (s.phase === 'calling' || s.phase === 'connecting' || s.phase === 'active')) {
-          // busy — refuse politely so the caller's UI clears fast
-          await signal(token, { __veil_call: 1, op: 'end', call_id: sig.call_id, reason: 'busy' }).catch(() => undefined);
+        // b77n (audit VAR-04): the offer follows the INVITE (which rang this phone and whose grant it
+        // approved): it belongs to the call ringing here, from the same chat, and comes once.
+        if (!s || s.role !== 'callee' || s.token !== token || s.callId !== sig.call_id || s.phase !== 'ringing' || s.pendingOfferSdp) {
+          console.log('[veil-call] offer ignored: no call from this chat is ringing for it (or it already came)');
           return;
         }
-        const core = s && s.callId === sig.call_id ? s.core : { ...IDLE_CORE, callId: sig.call_id };
         try {
-          const next = processOffer(core, sig);
+          s.core = processOffer(s.core, sig);
+          s.pendingOfferSdp = sig.sdp ?? null;
+          if (s.pc) void applyPrewarmOffer(s);
+        } catch (e) {
+          if (e instanceof CallRefusedError) console.log(`[veil-call] offer refused (${e.code}): replay/MITM guard did its job`);
+          else console.log(`[veil-call] offer error: ${(e as Error).message}`);
+        }
+        return;
+      }
+      case 'invite': {
+        // audit fix (b71): a withheld or replayed offer never rings. The
+        // authenticated send time must be within OFFER_MAX_AGE_MS back /
+        // OFFER_MAX_FUTURE_MS ahead, and a call id rings at most once.
+        await seenCalls.load();
+        if (seenCalls.has(sig.call_id) || s?.callId === sig.call_id) {
+          console.log('[veil-call] offer refused: this call id was already handled (replay)');
+          return;
+        }
+        const freshness = offerFreshness(sig);
+        if (freshness !== 'fresh') {
+          await seenCalls.add(sig.call_id);
+          console.log(`[veil-call] offer not rung: ${freshness} (authenticated send time outside the ring window)`);
+          // someone did try to call: leave the missed-call notice, never ring
+          if (!locallyEndedCalls.has(sig.call_id)) recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact');
+          return;
+        }
+        await seenCalls.add(sig.call_id);
+        if (s && s.phase === 'ringing' && s.callId !== sig.call_id && s.token === token) {
+          // b63 review (C-4): a newer call from the SAME chat replaces one
+          // still ringing; end the old one properly (its connection, timers,
+          // and its caller's ring)
+          teardown(s, 'replaced by a newer call', true);
+        } else if (s && s.phase === 'ringing') {
+          // audit fix (b71): a call from ANOTHER chat never ends this one.
+          // b71 (audit F-27): and it gets no automatic "busy" (that told the caller
+          // this phone was on a call); it rings out there and shows as missed here
+          recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact');
+          return;
+        }
+        if (s && (s.phase === 'calling' || s.phase === 'connecting' || s.phase === 'active')) {
+          recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact'); // b71 (audit F-27): no automatic "busy"
+          return;
+        }
+        // b77n (audit VAR-04): the invite rings; the SDP (and its DTLS fingerprint, bound by
+        // processOffer) comes in the offer the caller sends once this phone approved the grant
+        const core: CallState = { ...IDLE_CORE, callId: sig.call_id, phase: 'ringing' };
+        try {
+          if (typeof sig.grant !== 'string') throw new Error('invite without a call grant');
           const fresh: CallSession = {
-            callId: sig.call_id, token, peerLabel: peerLabel ?? s?.peerLabel ?? 'Vardum contact',
-            role: 'callee', phase: 'ringing', core: next,
+            callId: sig.call_id, token, peerLabel: peerLabel ?? 'Vardum contact',
+            role: 'callee', phase: 'ringing', core,
             monitor: new CallIntegrityMonitor(sig.call_id),
-            pc: null, local: null, pendingIce: [], pendingOfferSdp: sig.sdp ?? null,
+            pc: null, local: null, pendingIce: [], pendingOfferSdp: null,
             startedAt: null, endedReason: null, muted: false,
             seq: 0, ringVib: null, timeoutHandle: null, mediaUp: false,
             iceBatcher: null, iceRelease: false, heldIce: [], prewarming: null,
+            grant: sig.grant,
           };
           session = fresh;
           // b146: drain any candidates that arrived before this offer
-          const early = preOfferIce.get(sig.call_id);
-          if (early) { fresh.pendingIce.push(...early); preOfferIce.delete(sig.call_id); }
+          const early = preOfferIce.get(iceKey(token, sig.call_id));
+          if (early) { fresh.pendingIce.push(...early); preOfferIce.delete(iceKey(token, sig.call_id)); }
           if (androidRingerMode() !== 'silent') Vibration.vibrate(RING_PATTERN, true); // b199: Android silent = no buzz
           void startRingtone();
           armRingout(fresh);
           notify();
-          fresh.prewarming = prewarm(fresh); // 20 Oct 2026: relay allocations start while it rings
-          // 21 Oct 2026: tell the caller it really rings here
-          void signal(token, { __veil_call: 1, op: 'ringing', call_id: sig.call_id })
-            .catch((e: Error) => console.log(`[veil-call] ringing confirmation not sent: ${e.message}`));
+          // audit VAR-09 (1f51): NOT here. Approving the grant (and allocating) on receipt told the
+          // caller "the phone got the call" even when it never rang (background sync). The grant is
+          // approved and the connection prewarmed from ringShown() — the call screen is up with the
+          // app in front — or from answer(). Like 'ringing', which also goes from ringShown().
         } catch (e) {
-          if (e instanceof CallRefusedError) {
-            console.log(`[veil-call] offer refused (${e.code}): replay/MITI guard did its job`);
-          } else {
-            console.log(`[veil-call] offer error: ${(e as Error).message}`);
-          }
+          console.log(`[veil-call] invite error: ${(e as Error).message}`);
         }
         return;
       }
       case 'ringing': {
-        if (!s || s.callId !== sig.call_id || s.role !== 'caller' || s.phase !== 'calling') return;
+        if (!s || s.token !== token || s.callId !== sig.call_id || s.role !== 'caller' || s.phase !== 'calling') return;
         if (s.reach === 'ringing') return;
         s.reach = 'ringing';
         if (s.ackHandle) { clearTimeout(s.ackHandle); s.ackHandle = null; }
+        if ((s.ringoutAt ?? 0) - Date.now() < RING_AFTER_ACK_MS) armRingout(s, RING_AFTER_ACK_MS); // b71 (device test)
         void startRingback(s); // now the tone is honest
         notify();
         return;
       }
       case 'answer': {
-        if (!s || s.callId !== sig.call_id || s.role !== 'caller' || s.phase !== 'calling') return;
+        if (!s || s.token !== token || s.callId !== sig.call_id || s.role !== 'caller' || s.phase !== 'calling') return; // audit fix (b71): bound to this call's own chat
         const fp = extractDtlsFingerprint(sig.sdp ?? '');
         if (!fp) { s.monitor.record('fingerprint', 'answer SDP carried no DTLS fingerprint — refusing'); teardown(s, 'call refused', true); return; }
         s.core = { ...s.core, offerFingerprint: fp };
@@ -817,6 +1175,7 @@ export const CallManager = {
           await stopRingback();
           if (callGone(s) || !s.pc) return;
           await s.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: sig.sdp as string }) as never);
+          if (!checkAppliedRemote(s, s.pc)) return; // audit fix (b71): ended, red
           for (const ice of s.pendingIce) await addIce(s.pc, ice);
           s.pendingIce = [];
           clearRing(s);
@@ -828,16 +1187,17 @@ export const CallManager = {
         return;
       }
       case 'ice': {
-        if (s && s.callId !== sig.call_id) return; // belongs to another call
+        if (s && (s.callId !== sig.call_id || s.token !== token)) return; // belongs to another call (or another chat)
         if (!s) {
           // b146: candidates can beat the offer across poll batches (the same
           // race the web client fixed). Buffer them per call and drain into
           // pendingIce the moment the offer creates the session — otherwise
           // the media path silently never connects.
           if (!sig.call_id) return;
-          if (!preOfferIce.has(sig.call_id)) preOfferIce.set(sig.call_id, []);
-          preOfferIce.get(sig.call_id)!.push(sig);
-          if (preOfferIce.get(sig.call_id)!.length > 64) preOfferIce.get(sig.call_id)!.shift();
+          const key = iceKey(token, sig.call_id);
+          if (!preOfferIce.has(key)) preOfferIce.set(key, []);
+          preOfferIce.get(key)!.push(sig);
+          if (preOfferIce.get(key)!.length > 64) preOfferIce.get(key)!.shift();
           return;
         }
         if (s.phase === 'ended') return;
@@ -846,6 +1206,8 @@ export const CallManager = {
         return;
       }
       case 'end': {
+        // audit fix (b71): an end from another chat never touches this call
+        if (s && s.callId === sig.call_id && s.token !== token) return;
         if (s && s.callId === sig.call_id) {
           // caller gave up while we were still ringing — a missed call
           const missedCandidate = s.role === 'callee' && s.phase === 'ringing' && !recordedMisses.has(sig.call_id);
@@ -856,7 +1218,10 @@ export const CallManager = {
         // b157: end for a call this device never saw ring (offer held while
         // the app was locked). Our own decline/hangup already marked the
         // call locally-ended, so that echo never counts as a miss.
-        if (!locallyEndedCalls.has(sig.call_id)) recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact');
+        // b71 (audit F-29): only for a call id whose offer this phone received —
+        // a bare "end" can no longer plant a missed-call notice
+        await seenCalls.load();
+        if (seenCalls.has(sig.call_id) && !locallyEndedCalls.has(sig.call_id)) recordMissed(sig.call_id, token, peerLabel ?? 'Vardum contact');
         return;
       }
     }

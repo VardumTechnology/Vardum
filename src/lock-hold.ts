@@ -5,7 +5,8 @@
  * never load". A screen running a long, user-started job holds the
  * INACTIVITY lock off until it finishes. Backgrounding / locking the phone
  * still locks instantly (AppState path, untouched); this only pauses the
- * no-touch timer, and the timer restarts from zero when the hold ends.
+ * no-touch timer. b70 (audit L-8): the job itself is not activity, so when it
+ * ends the timer counts from the last real touch (an idle phone locks at once).
  */
 let holds = 0;
 let holdSeq = 0;
@@ -21,18 +22,45 @@ function keepAwake(tag: string, on: boolean): void {
   } catch (e) { console.log(`[veil-awake] module unavailable: ${(e as Error)?.message ?? e}`); }
 }
 
+/** b70 (re-review 5): a hold ends by itself after this long (a stalled relay or
+ *  network used to keep the app unlocked and the screen on for good).
+ *  audit VAR-16: 5 minutes (was 15) — a 24 MB vault moves well inside it on a working
+ *  connection, and the stall watchdog ends a dead transfer after 30 s anyway. */
+export const HOLD_MAX_MS = 5 * 60_000;
+
+/** audit VAR-16: every live hold's release, so a departure can end them all */
+const live = new Set<() => void>();
+/** audit VAR-16: run when the LAST hold ends (the App checks the inactivity rule at once, so a
+ *  phone left alone during a job locks before the job's result — a vault listing — is shown) */
+let holdEndedHook: (() => void) | null = null;
+export function setHoldEndedHook(fn: (() => void) | null): void { holdEndedHook = fn; }
+
 /** Start a hold; call the returned function exactly when the job ends. */
 export function holdAutoLock(): () => void {
   holds++;
   const tag = `veil-job-${++holdSeq}`;
   keepAwake(tag, true);
   let released = false;
-  return () => {
+  const release = () => {
     if (released) return;
     released = true;
+    live.delete(release);
+    clearTimeout(deadline);
     holds = Math.max(0, holds - 1);
     keepAwake(tag, false);
+    if (holds === 0) { try { holdEndedHook?.(); } catch { /* never throws into the job */ } }
   };
+  const deadline = setTimeout(release, HOLD_MAX_MS);
+  live.add(release);
+  return release;
+}
+
+/** audit VAR-16: leaving the app ends every hold (the screen-on request included); a hold never
+ *  carries across a departure */
+export function releaseAllHolds(): number {
+  const all = [...live];
+  for (const r of all) r();
+  return all.length;
 }
 
 export function autoLockHeld(): boolean {
@@ -49,9 +77,24 @@ export function autoLockHeld(): boolean {
  * foreground, so any other departure still locks instantly.
  */
 let systemSheetUntil = 0;
-export function expectSystemSheet(ms = 120_000): void { systemSheetUntil = Date.now() + ms; }
-export function systemSheetExpected(): boolean { return Date.now() < systemSheetUntil; }
+/** b70 (audit L-8): was 2 minutes */
+export const SYSTEM_SHEET_MS = 60_000;
+/** b75 (audit AL-5): whether a departure may be treated as expected at all. The app
+ *  sets it to "not in Nothing-at-Rest": there EVERY departure wipes and locks, a
+ *  picker or share sheet included (the grace used to skip both, for good if Vardum
+ *  never came back to the foreground). */
+let sheetGraceAllowed: () => boolean = () => true;
+export function setSystemSheetPolicy(allowed: () => boolean): void { sheetGraceAllowed = allowed; }
+export function expectSystemSheet(ms = SYSTEM_SHEET_MS): void { systemSheetUntil = Date.now() + ms; }
+export function systemSheetExpected(): boolean {
+  let allowed = true;
+  try { allowed = sheetGraceAllowed(); } catch { allowed = false; }
+  return allowed && Date.now() < systemSheetUntil;
+}
 export function systemSheetDone(): void { systemSheetUntil = 0; }
+/** b75 (audit AL-5): how much of the grace is left (the app backs it with a timer that
+ *  locks when it runs out, whether or not Vardum comes back to the foreground) */
+export function systemSheetLeftMs(): number { return Math.max(0, systemSheetUntil - Date.now()); }
 
 /** Run `open` (a picker / prompt / share sheet) with the departure expected
  *  only while it is open — cleared the moment it returns or throws. */

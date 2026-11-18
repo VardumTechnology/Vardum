@@ -1,9 +1,14 @@
 /**
- * @veil/device — funnel, attribution, activation & session-health instrumentation.
+ * @veil/device — opt-in funnel and activation milestones.
  *
  * ONBOARDING-FUNNEL-FIX-SPEC + LAUNCH MASTER PLAN (Sept 30 work order).
  *
- * Design rules (zero-knowledge discipline):
+ * Design rules:
+ *   - b71 (audit): OPT-IN. Nothing is sent unless the user turned on
+ *     Settings > "Share usage counts" (off by default; setFunnelConsent).
+ *     The rows are written with the account's sign-in, so the relay operator
+ *     can tell which account sent them; the relay deletes them after 30 days.
+ *     There are no per-launch rows: only one-time milestones.
  *   - Events carry NO message content, NO emails, NO phrases — only the
  *     step name and the auto created_date timestamp the backend adds.
  *   - Everything is best-effort: an event that cannot reach the relay is
@@ -19,7 +24,7 @@
  *   veil_funnel_done_<step>   once-guard flags per install
  *   veil_first_open_ts        ISO ms string, set on first open with an account
  *   veil_sess_crash           '1' written by the polyfills fatal interceptor
- *   veil_attribution_pending  JSON answer that could not reach the relay yet
+ *   veil_attribution_pending  (older builds) a parked attribution answer — now deleted
  */
 
 /** Minimal storage surface (KeychainStorage satisfies this). */
@@ -78,8 +83,15 @@ export const ONCE_STEPS: ReadonlySet<string> = new Set([
 /** for tests */
 export const FUNNEL_INTERNAL_KEYS = { DONE_PREFIX, FIRST_OPEN_KEY, CRASH_KEY, ATTR_PENDING_KEY };
 
+/** b71 (audit): the user's choice in Settings ("Share usage counts"); off until set */
+let consent: () => boolean = () => false;
+export function setFunnelConsent(fn: () => boolean): void {
+  consent = fn;
+}
+
 async function emitOnce(relay: FunnelRelay, storage: FunnelStorage, step: FunnelStep, extra?: Record<string, unknown>): Promise<boolean> {
   if (!ONCE_STEPS.has(step)) throw new Error(`emitOnce called for non-once step ${step}`);
+  if (!consent()) return false; // b71 (audit): opt-in only; the guard stays unset
   try {
     if (await storage.get(DONE_PREFIX + step)) return false;
   } catch { /* read failure = treat as not done */ }
@@ -92,29 +104,13 @@ async function emitOnce(relay: FunnelRelay, storage: FunnelStorage, step: Funnel
   }
 }
 
-async function emitRaw(relay: FunnelRelay, step: FunnelStep): Promise<boolean> {
+/** b71 (audit): no longer sends anything. One row per cold start was a launch log
+ *  tied to the account; the crash marker is only cleared on the phone now. */
+export async function noteSessionStart(_relay: FunnelRelay, storage: FunnelStorage): Promise<void> {
   try {
-    await relay.entityCreate('OnboardingStep', { step });
-    return true;
-  } catch {
-    return false; // dropped silently
-  }
-}
-
-/** One row per cold start (denominator of crash-free sessions). */
-export async function noteSessionStart(relay: FunnelRelay, storage: FunnelStorage): Promise<void> {
-  // drain the fatal-interceptor flag first: previous session hit a JS fatal.
-  // The flag is cleared ONLY when the row actually landed — an offline boot
-  // must not swallow the crash silently.
-  try {
-    if (await storage.get(CRASH_KEY)) {
-      if (await emitRaw(relay, FUNNEL_STEPS.SESSION_CRASHED)) {
-        await storage.set(CRASH_KEY, ''); // cleared, not removed: an overwrite is
-        // lighter than the RN keychain remove() path; empty string is falsy-checked
-      }
-    }
+    if (await storage.get(CRASH_KEY)) await storage.set(CRASH_KEY, '');
+    if (await storage.get(ATTR_PENDING_KEY)) await (storage.remove ? storage.remove(ATTR_PENDING_KEY) : storage.set(ATTR_PENDING_KEY, ''));
   } catch { /* never a crash source */ }
-  await emitRaw(relay, FUNNEL_STEPS.SESSION_START);
 }
 
 /**
@@ -173,68 +169,5 @@ export async function noteVaultRetrieved(relay: FunnelRelay, storage: FunnelStor
   await emitOnce(relay, storage, FUNNEL_STEPS.ACTIVATED_VAULT);
 }
 
-// ---------------------------------------------------------------------------
-// Attribution (attribution-spec)
-// ---------------------------------------------------------------------------
-
-export const ATTRIBUTION_MAX_DETAIL = 60;
-
-/** Skippable one-tap prompt options — exact spec wording. */
-export const ATTRIBUTION_OPTIONS = [
-  { label: 'Explainer video', category: 'explainer_video' },
-  { label: 'Social media', category: 'social_media' },
-  { label: 'YouTube/creator video', category: 'youtube_creator' },
-  { label: 'Article', category: 'article' },
-  { label: 'Product Hunt', category: 'product_hunt' },
-  { label: 'Press/news', category: 'press_news' },
-  { label: 'A friend', category: 'friend' },
-  { label: 'Other', category: 'other' },
-  { label: 'Prefer not to say', category: 'prefer_not_say' },
-] as const;
-
-export interface AttributionAnswer {
-  veilId: string;
-  category: string;
-  /** free text (Other) or the web-side veil_src fallback; <= 60 chars */
-  detail?: string | null;
-}
-
-function clampDetail(detail?: string | null): string | null {
-  if (!detail) return null;
-  const trimmed = detail.trim().slice(0, ATTRIBUTION_MAX_DETAIL);
-  return trimmed || null;
-}
-
-/**
- * Persist the answer to the AttributionSource entity — NOT on the identity
- * record. If the relay cannot take it yet (entity not live / offline), the
- * answer is parked locally and flushed on a later open.
- */
-export async function saveAttribution(relay: FunnelRelay, storage: FunnelStorage, answer: AttributionAnswer): Promise<boolean> {
-  const record = {
-    veil_id: answer.veilId,
-    source_category: answer.category,
-    source_detail: clampDetail(answer.detail),
-  };
-  try {
-    await relay.entityCreate('AttributionSource', record);
-    return true;
-  } catch {
-    try { await storage.set(ATTR_PENDING_KEY, JSON.stringify(record)); } catch { /* best-effort */ }
-    return false;
-  }
-}
-
-/** Retry a parked attribution answer (called on app open). */
-export async function flushPendingAttribution(relay: FunnelRelay, storage: FunnelStorage): Promise<boolean> {
-  let raw: string | null = null;
-  try { raw = await storage.get(ATTR_PENDING_KEY); } catch { return false; }
-  if (!raw) return false;
-  try {
-    await relay.entityCreate('AttributionSource', JSON.parse(raw) as Record<string, unknown>);
-    await storage.set(ATTR_PENDING_KEY, '');
-    return true;
-  } catch {
-    return false; // stays parked
-  }
-}
+// b71: the "How did you hear about Vardum?" prompt is gone (owner decision); an
+// answer an older build parked on the phone is deleted at the next launch, never sent.

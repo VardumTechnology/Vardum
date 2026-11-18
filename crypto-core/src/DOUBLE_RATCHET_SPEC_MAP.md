@@ -30,7 +30,7 @@ assertions below. Any byte-level engine change must fail the suite.
 | KDF_RK(RK, DH_out) = HKDF(salt = RK, ikm = DH_out) | `deriveRoot`: HKDF-SHA256, ikm = `DH_out ‖ PQ_secret` (PQ part omitted when absent), info `vardum-ratchet-6/rk`, 64-byte output split (RK', CK) | conformant + PQ extension (vectors `rootKeyOut`, `rootKeyPqOut`) |
 | KDF_CK(CK): mk = HMAC(ck, 0x01), ck' = HMAC(ck, 0x02) | `advanceChain` | byte-for-byte spec (vectors `ckMessageKey`, `ckNext`) |
 | DHRatchet: skip to `pn`, KDF_RK with the current pair, GENERATE_DH, KDF_RK with the fresh pair | `decryptMessage` → `skipOldChainBeforeRotation` → `stepRatchet` (`rootA`, `rootB`) | conformant (the two-stage root is spec DHRatchet, not a deviation); signature checked first (deviation 3) |
-| Skipped message keys (MAX_SKIP) | `storeSkipped` / `takeSkipped`; `MAX_COUNTER_GAP = 500`, `MAX_SKIPPED_PER_CHAIN = 100`, at most 500 stored keys over all chains | conformant + explicit fail-closed on desync |
+| Skipped message keys (MAX_SKIP) | `storeSkipped` / `takeSkipped`; `MAX_COUNTER_GAP = 500`, `MAX_SKIPPED_PER_CHAIN = 500` (equal to the gap), skipped keys dropped after `SKIPPED_KEY_MAX_AGE_MS` (pruned on decrypt and on every save) | conformant + explicit fail-closed on desync |
 | Header (dh, pn, n) | JSON header `{v, rp, pn, n, pq, pqct?, sig}` | superset (protocol tag, PQ fields, signature) |
 | ENCRYPT(mk, pt, AD) | AES-256-GCM, random 12-byte IV, AD = the exact header bytes as sent (never re-serialised) | conformant (AEAD per spec §5.2 recommendations) |
 | DECRYPT failure leaves state unchanged | all work on a candidate copy; committed only after AEAD and frame parse succeed | conformant (the spec discards state changes when decryption raises an exception) |
@@ -59,8 +59,10 @@ assertions below. Any byte-level engine change must fail the suite.
    - one-tap contact: `shared = DH(ek, SPK) ‖ DH(ek, IK_responder) ‖ ML-KEM ss`,
      with the IK-signed SPK, the IK-signed ML-KEM prekey and the responder's
      **pinned** Ed25519 identity key converted to X25519 (as X3DH's
-     `DH(EK_A, IK_B)`); the request `{v:3, t, ek, to, pq, spk, d}` is signed
-     by the initiator's IK and carries the canonical dials `d`.
+     `DH(EK_A, IK_B)`); the request `{v:4, t, ek, to, pq, spk, d}` is signed
+     by the initiator's IK and carries the canonical dials `d`. The session root
+     also covers both identity keys (`contactRk0Token`: `token|ik2:<initiator IK>:<responder IK>`);
+     v3 requests (token-only root) are refused.
    There is no initiator-identity DH term (X3DH's `DH(IK_A, SPK_B)`): the
    initiator is authenticated by its IK signature over the request, checked
    against the responder's pin. No one-time prekeys (OPKs): disclosed,
@@ -78,7 +80,7 @@ assertions below. Any byte-level engine change must fail the suite.
    authenticated by the AEAD. Defence in depth: both pairs derive from `rk0`,
    and the root salt already makes an injected `rp` non-exploitable.
 
-4. **Epoch replay guard** (`seenRemotePubs`, last 64): a header replaying an
+4. **Epoch replay guard** (`seenRemotePubs`, last 512): a header replaying an
    already-replaced remote pub is rejected outright.
 
 5. **Own-echo guard** (`myPubs`, last 64): an envelope carrying one of this

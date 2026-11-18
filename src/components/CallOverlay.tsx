@@ -1,13 +1,17 @@
 /**
  * VEIL CallOverlay (b144, W3): full-screen call surface — ring out, ring in,
  * active call with the local-only integrity dot, and the ended card.
+ * audit fix (b71): the dot's label is positive only when THIS call's peer
+ * fingerprint was checked against the encrypted signalling (CallManager
+ * checkAppliedRemote), and names only what protects the audio (DTLS-SRTP).
  * Vardum palette (#15151B card, #FFFFFF accent; teal only for the V,
  * no raw error text — CallRefused reasons are surfaced verbatim from the
  * calls.ts guard rails, which never carry diagnostics).
  */
 import React, { useEffect, useState } from 'react';
-import { Modal, View, Text, TouchableOpacity, StyleSheet, Vibration } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, Vibration, AppState } from 'react-native';
 import { CallManager, type CallSnapshot } from '../calls/CallManager';
+import { SecureOverlay } from './SecureOverlay'; // audit VAR-02: in-window, so FLAG_SECURE / the recording black-out cover it
 
 const CARD = '#15151B';
 const ACCENT = '#FFFFFF';
@@ -32,17 +36,30 @@ function phaseLine(s: CallSnapshot, dur: string): string {
   return s.endedReason ? `Call ended · ${s.endedReason}` : 'Call ended';
 }
 
-const INTEGRITY_LABEL: Record<CallSnapshot['integrity'], string> = {
-  ok: 'Integrity verified',
-  amber: 'Minor interference detected',
-  red: 'Someone may be in the middle — hang up',
-};
+// 'unchecked' shows nothing: no positive claim until the check passed.
+// b71 (audit F-28): "keys checked" only once the live DTLS certificate matched
+function integrityLabel(s: CallSnapshot): string | null {
+  if (s.integrity === 'red') return 'Someone may be in the middle — hang up';
+  if (s.integrity === 'unchecked') return null;
+  const base = s.certChecked ? 'Encrypted (DTLS-SRTP), keys checked' : 'Encrypted (DTLS-SRTP)';
+  return s.integrity === 'amber' ? base + ' · weak connection' : base;
+}
 
 export function CallOverlay() {
   const [snap, setSnap] = useState<CallSnapshot | null>(() => CallManager.snapshot());
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => CallManager.subscribe(setSnap), []);
+  // audit fix (b71): the caller hears "Ringing…" only once this screen is up
+  // with the app in front (not for an offer that rang nowhere visible)
+  const [appActive, setAppActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (st) => setAppActive(st === 'active'));
+    return () => sub.remove();
+  }, []);
+  useEffect(() => {
+    if (snap && snap.phase === 'ringing' && snap.role === 'callee' && appActive) CallManager.ringShown(snap.callId);
+  }, [snap?.phase, snap?.callId, appActive]);
   useEffect(() => {
     if (!snap || snap.phase !== 'active') return;
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -54,7 +71,7 @@ export function CallOverlay() {
   const isCallee = snap.role === 'callee';
 
   return (
-    <Modal transparent={false} animationType="fade" visible onRequestClose={() => CallManager.hangup()}>
+    <SecureOverlay visible transparent={false} layer="call" onRequestClose={() => CallManager.hangup(snap.callId)}>
       <View style={styles.wrap}>
         <View style={styles.card}>
           {/* arcs + wordmark — lock-screen family (owner standing design rule) */}
@@ -71,10 +88,10 @@ export function CallOverlay() {
 
           {/* local-only integrity dot — never leaves this device. Only shown
               once the call is genuinely active, not during ringing/connecting. */}
-          {snap.phase === 'active' ? (
+          {snap.phase === 'active' && integrityLabel(snap) ? (
             <View style={styles.integrityRow}>
-              <View style={[styles.integrityDot, styles[('dot_' + snap.integrity) as 'dot_ok' | 'dot_amber' | 'dot_red'] as never]} />
-              <Text style={styles.integrityTxt}>{INTEGRITY_LABEL[snap.integrity]}</Text>
+              <View style={[styles.integrityDot, styles[('dot_' + snap.integrity) as 'dot_ok' | 'dot_amber' | 'dot_red' | 'dot_unchecked'] as never]} />
+              <Text style={styles.integrityTxt}>{integrityLabel(snap)}</Text>
             </View>
           ) : (
             <View style={styles.integrityRowSpacer} />
@@ -83,10 +100,10 @@ export function CallOverlay() {
           {/* controls */}
           {snap.phase === 'ringing' && isCallee ? (
             <View style={styles.btnRow}>
-              <TouchableOpacity style={[styles.btn, styles.declineBtn]} onPress={() => { Vibration.cancel(); CallManager.decline(); }}>
+              <TouchableOpacity style={[styles.btn, styles.declineBtn]} onPress={() => { Vibration.cancel(); CallManager.decline(snap.callId); }}>
                 <Text style={styles.btnTxt}>Decline</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.btn, styles.answerBtn]} onPress={() => { Vibration.cancel(); void CallManager.answer(); }}>
+              <TouchableOpacity style={[styles.btn, styles.answerBtn]} onPress={() => { Vibration.cancel(); void CallManager.answer(snap.callId); }}>
                 <Text style={styles.answerTxt}>Answer</Text>
               </TouchableOpacity>
             </View>
@@ -95,20 +112,20 @@ export function CallOverlay() {
               <TouchableOpacity style={[styles.btn, snap.muted ? styles.muteOnBtn : null]} onPress={() => CallManager.toggleMute()}>
                 <Text style={styles.btnTxt}>{snap.muted ? 'Unmute' : 'Mute'}</Text>
               </TouchableOpacity>
-              <TouchableOpacity style={[styles.btn, styles.endBtn]} onPress={() => CallManager.hangup()}>
+              <TouchableOpacity style={[styles.btn, styles.endBtn]} onPress={() => CallManager.hangup(snap.callId)}>
                 <Text style={styles.btnTxt}>End</Text>
               </TouchableOpacity>
             </View>
           ) : snap.phase === 'calling' || snap.phase === 'connecting' ? (
             <View style={styles.btnRow}>
-              <TouchableOpacity style={[styles.btn, styles.endBtn]} onPress={() => CallManager.hangup()}>
+              <TouchableOpacity style={[styles.btn, styles.endBtn]} onPress={() => CallManager.hangup(snap.callId)}>
                 <Text style={styles.btnTxt}>Cancel</Text>
               </TouchableOpacity>
             </View>
           ) : null}
         </View>
       </View>
-    </Modal>
+    </SecureOverlay>
   );
 }
 
@@ -127,6 +144,7 @@ const styles = StyleSheet.create({
   dot_ok: { backgroundColor: ACCENT },
   dot_amber: { backgroundColor: '#ffb454' },
   dot_red: { backgroundColor: '#ff6b6b' },
+  dot_unchecked: { backgroundColor: MUTED },
   integrityTxt: { color: MUTED, fontSize: 12, letterSpacing: 0.5 },
   btnRow: { flexDirection: 'row', gap: 18 },
   btn: { paddingHorizontal: 34, paddingVertical: 15, borderRadius: 14, borderWidth: 1, borderColor: ACCENT },

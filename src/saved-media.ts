@@ -51,10 +51,41 @@ export async function deleteSavedMedia(ids: string[]): Promise<void> {
   }
   const assets = ids.filter((id) => !isSafUri(id));
   if (assets.length && Platform.OS !== 'android') {
+    // b71 (audit): no permission, or the user tapping "Don't Allow" on the iOS
+    // prompt, is a failed delete (it used to count as done). iOS also keeps what
+    // was deleted in Recently Deleted for 30 days; Vardum can't empty that.
     try {
       const perm = await MediaLibrary.getPermissionsAsync();
-      if (perm.granted) await MediaLibrary.deleteAssetsAsync(assets);
+      if (!perm.granted) throw new Error('Photos access is off, so the saved images could not be deleted.');
+      if ((await MediaLibrary.deleteAssetsAsync(assets)) === false) throw new Error('The saved images were not deleted (the request was refused).');
     } catch (e) { firstError ??= e; }
   }
   if (firstError) throw firstError;
+}
+
+/** b70 (re-review 4): remember a file this app saved to Photos (asset id) or a
+ *  chosen folder (content:// URI), so every wipe deletes it with the rest */
+// b70 (re-review 10): one update at a time (two saves finishing together used to drop one
+// id), and a refused write (a wipe's write freeze) is retried, so no saved file falls off
+// the list every wipe deletes
+let trackQueue: Promise<unknown> = Promise.resolve();
+export function trackSavedMedia(
+  storage: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> } | null | undefined,
+  id: string | null | undefined,
+): Promise<void> {
+  if (!storage || !id) return Promise.resolve();
+  const run = trackQueue.catch(() => undefined).then(async () => {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        const raw = await storage.get('veil_saved_media');
+        const arr = raw ? (JSON.parse(raw) as unknown[]).filter((x): x is string => typeof x === 'string') : [];
+        if (arr.includes(id)) return;
+        arr.push(id);
+        if ((await storage.set('veil_saved_media', JSON.stringify(arr))) !== false) return;
+      } catch { /* retried */ }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  });
+  trackQueue = run;
+  return run.then(() => undefined);
 }

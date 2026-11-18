@@ -15,8 +15,9 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { holdAutoLock, withSystemSheet } from '../lock-hold';
 import * as FileSystem from 'expo-file-system';
+import { tmpPath, deleteQuietly, adoptIntoTmp, excludeFromBackup, dropPickerInbox /* b77u (U-M6) */ } from '../local-files';
 import * as MediaLibrary from 'expo-media-library';
-import { saveToChosenFolder, usesFolderPicker } from '../saved-media';
+import { saveToChosenFolder, usesFolderPicker, trackSavedMedia } from '../saved-media';
 import { Ionicons } from '@expo/vector-icons';
 import { useThemedPrompt } from './ThemedPrompt';
 import { useThemedChooser } from './ThemedSheets';
@@ -39,14 +40,17 @@ import type { VeilApp } from '../veil-app';
 import { visibleUnderIdentity } from '../owner-veil-filter';
 import {
   type VaultFileEntry, createVaultContainer, openVaultContainer, vaultRecord, sealVaultName, openVaultName,
-  type NotePayload, newNoteId, noteMetaOf,
-  decodePng, encodePng, buildStegoStream, lsbEmbed, extractStego,
+  type NotePayload, newNoteId, noteMetaOf, syncNotesManifest,
+  decodePng, encodePng, embedStego, neutralImageName, extractStego,
   runSelfTest, type SelfTestResult,
 } from '../../vendor/device/src/index';
 import { fromB64, utf8, toB64, randomBytes } from '../../vendor/crypto-core/src/index';
-import { deriveVaultKey, vaultEncrypt, vaultDecrypt, LOCK_CODE_PBKDF2_ITERATIONS } from '../../vendor/crypto-core/src/vault';
+import { deriveVaultKey, vaultEncrypt, vaultDecrypt, VAULT_PBKDF2_ITERATIONS_NEW } from '../../vendor/crypto-core/src/vault';
+import { passphraseProblem } from '../password';
 import { noteVaultRetrieved } from '../../vendor/device/src/funnel';
 import { PERMISSION_DECLINED } from '../platformText';
+import { privateComposerProps } from '../secret-entry'; // audit VAR-42 (1f51): Notes and Stego honour Private keyboard
+import { copySensitive } from '../clipboard-guard'; // b77q (audit 3 AP-3)
 
 
 type Tool = 'vaults' | 'notes' | 'stego';
@@ -55,6 +59,10 @@ type Tool = 'vaults' | 'notes' | 'stego';
  * b111 (owner directive: no raw internal errors on screen, ever): raw
  * exception text goes to the Metro console; the UI gets one human sentence.
  */
+/** b77s (audit 4 DV-3): the most pixels Extract decodes (Hide writes at most 2048 x 2048, about 4.2 MP) */
+export const STEGO_EXTRACT_MAX_PIXELS = 8_000_000;
+export const STEGO_EXTRACT_TOO_LARGE = 'This image is too large to hold a Vardum hidden message. Vardum hides messages in images up to 2048 pixels a side, and Extract reads images up to 8 megapixels. Pick the original stego PNG.';
+
 function friendlyError(e: unknown, what: string): string {
   const err = e as Error;
   console.log(`[veil-error] ${what}:`, String(err?.message ?? e), err?.stack ?? '');
@@ -63,6 +71,9 @@ function friendlyError(e: unknown, what: string): string {
     return 'Connection problem — check your internet and try again.';
   if (s.includes('permission') || s.includes('denied') || s.includes('not authorized'))
     return PERMISSION_DECLINED;
+  // b77m merge (audit VAR-31): the PNG decoder's dimension / data cap — its own sentence (not the media size limit)
+  if (s.includes('unsupported png: the image is too large'))
+    return 'This image is too large to open — Vardum reads images up to 40 megapixels (20,000 pixels a side). Pick a smaller image.';
   if (s.includes('too small to hold'))
     return 'This image is too small to hide that message — pick a larger photo or shorten the message.';
   if (s.includes('wrong passphrase'))
@@ -92,6 +103,11 @@ function vaultCachePath(containerUri: string): string {
   let h = 5381;
   for (let i = 0; i < containerUri.length; i++) h = ((h * 33) ^ containerUri.charCodeAt(i)) >>> 0;
   return `${FileSystem.cacheDirectory}veil-vault-${h.toString(16)}.bin`;
+}
+/** audit VAR-61: a deleted vault's cached container and its .meta note (best effort) */
+async function deleteVaultCache(containerUri: string): Promise<void> {
+  const p = vaultCachePath(containerUri);
+  for (const f of [p, `${p}.meta`]) { try { await FileSystem.deleteAsync(f, { idempotent: true }); } catch { /* best-effort */ } }
 }
 /** b199: shown when a vault download makes no progress for 30 seconds */
 const VAULT_STALL_MSG = 'Couldn’t download the vault — the connection stalled. Check your connection and try again.';
@@ -158,9 +174,14 @@ async function shareBytes(bytes: Uint8Array, filename: string, mime: string): Pr
   } catch {
     throw nativeModuleMissingError('expo-sharing');
   }
-  const path = `${FileSystem.cacheDirectory}${filename}`;
+  // b70 (VAR-03): the plaintext copy lives in the temp folder and goes once the sheet closes
+  const path = await tmpPath(filename);
   await FileSystem.writeAsStringAsync(path, bytesToB64(bytes), { encoding: FileSystem.EncodingType.Base64 });
-  await withSystemSheet(() => Sharing.shareAsync(path, { mimeType: mime, dialogTitle: filename }));
+  try {
+    await withSystemSheet(() => Sharing.shareAsync(path, { mimeType: mime, dialogTitle: filename }));
+  } finally {
+    await deleteQuietly(path);
+  }
 }
 
 /** something the in-app viewer can show (vault file, stego output image, …) */
@@ -240,8 +261,9 @@ function ContentsOverlay({ partition, files, onClose, onShowFile, onSave }: {
     <View style={[styles.viewerBackdrop, styles.backdropCenter]}>
       <TouchableOpacity style={StyleSheet.absoluteFill} onPress={onClose} activeOpacity={1} />
       <View style={styles.contentsCard}>
-        <Text style={styles.contentsTitle}>Opened the {partition === 'hidden' ? 'hidden' : 'decoy'} volume</Text>
-        <Text style={styles.contentsSub}>{files.length} file{files.length === 1 ? '' : 's'} inside · nothing about the other volume is revealed</Text>
+        {/* b75 (audit VS-3): one neutral label for either volume (it used to say "decoy" on screen) */}
+        <Text style={styles.contentsTitle}>Vault opened</Text>
+        <Text style={styles.contentsSub}>{files.length} file{files.length === 1 ? '' : 's'} inside</Text>
         {files.map((f) => (
           <View key={f.name} style={styles.contentsRow}>
             <View style={{ flex: 1 }}>
@@ -266,6 +288,8 @@ export interface ToolScreenProps {
   decoy?: boolean;
   /** b101: current device's Veil ID — tags new rows and filters extinct-identity ghosts */
   veilId?: string | null;
+  /** audit VAR-42 (1f51): Settings → Private keyboard, for the note and hidden-message fields */
+  privateKeyboard?: boolean;
 }
 
 /** b199 UI redesign: shared header for Vaults / Notes / Stego (Settings / Contacts / Conversations format). */
@@ -287,9 +311,13 @@ function ToolHeader({ title, sub, action, onAction }: { title: string; sub: stri
 
 /** decoy (duress) view: the same empty screen a new user sees, not a bare line of text */
 function DecoyEmpty({ title, sub, list, empty }: { title: string; sub: string; list: string; empty: string }) {
+  // b70 (re-review 10): identical to a real empty account — the same ＋ New button and
+  // text (their absence told a captor this was the decoy); creating fails like an offline phone
+  const [err, setErr] = useState<string | null>(null);
   return (
     <View style={styles.sect}>
-      <ToolHeader title={title} sub={sub} />
+      <ToolHeader title={title} sub={sub} action="＋ New" onAction={() => setErr('Could not reach the relay. Try again later.')} />
+      {err ? <Text style={styles.err}>{err}</Text> : null}
       <Text style={styles.groupTitle}>{list}</Text>
       <View style={styles.group}><Text style={styles.emptyRow}>{empty}</Text></View>
     </View>
@@ -307,7 +335,7 @@ export function VaultsScreen({ app, decoy, veilId }: ToolScreenProps) {
   return (
     <View style={styles.fill}>
       <ScrollView style={styles.fill} contentContainerStyle={styles.body}>
-        {decoy ? <DecoyEmpty title="Vaults" sub="Files encrypted with your passphrase on this device. The server stores ciphertext only." list="Your vaults" empty="No vaults yet." /> : <VaultsView app={app} veilId={veilId} ask={ask} choose={choose} onShowFile={(f) => setViewer(f)} onContents={setContents} />}
+        {decoy ? <DecoyEmpty title="Vaults" sub="Files encrypted with your passphrase on this device. The server stores ciphertext only." list="Your vaults" empty="No vaults yet. Tap ＋ New to make one." /> : <VaultsView app={app} veilId={veilId} ask={ask} choose={choose} onShowFile={(f) => setViewer(f)} onContents={setContents} />}
       </ScrollView>
       {contents ? (
         <ContentsOverlay
@@ -325,22 +353,22 @@ export function VaultsScreen({ app, decoy, veilId }: ToolScreenProps) {
   );
 }
 
-export function NotesScreen({ app, decoy, veilId }: ToolScreenProps) {
+export function NotesScreen({ app, decoy, veilId, privateKeyboard }: ToolScreenProps) {
   return (
     <ScrollView style={styles.fill} contentContainerStyle={styles.body}>
-      {decoy ? <DecoyEmpty title="Notes" sub="Private notes, end-to-end encrypted. Only ciphertext reaches the server; the key never leaves this device." list="Your notes" empty="No notes yet." /> : <NotesView app={app} veilId={veilId} />}
+      {decoy ? <DecoyEmpty title="Notes" sub="Private notes, encrypted on this phone. Only ciphertext reaches the server; the key never leaves this device." list="Your notes" empty="No notes yet. Tap ＋ New to write one." /> : <NotesView app={app} veilId={veilId} privateKeyboard={!!privateKeyboard} />}
     </ScrollView>
   );
 }
 
-export function StegoScreen({ storage }: Omit<ToolScreenProps, 'app'> & { storage?: VeilApp['storage'] }) {
+export function StegoScreen({ storage, privateKeyboard }: Omit<ToolScreenProps, 'app'> & { storage?: VeilApp['storage'] }) {
   const [viewer, setViewer] = useState<ViewerItem | null>(null);
   // b105: VEIL-branded carrier chooser for the Stego flows (owner request Sept 22)
   const { node: chooserNode, choose } = useThemedChooser();
   return (
     <View style={styles.fill}>
       <ScrollView style={styles.fill} contentContainerStyle={styles.body}>
-        <StegoView storage={storage} choose={choose} onEmbedded={(item) => setViewer(item)} />
+        <StegoView storage={storage} choose={choose} onEmbedded={(item) => setViewer(item)} privateKeyboard={!!privateKeyboard} />
       </ScrollView>
       {viewer ? <ViewerOverlay item={viewer} onClose={() => setViewer(null)} /> : null}
       {chooserNode}
@@ -415,8 +443,8 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
     const a = r.assets?.[0];
     if (!a?.uri) return;
     const name = a.fileName || `photo-${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
-    const entry = { name, type: a.mimeType || 'image/jpeg', uri: a.uri };
-    if (forHidden) setHiddenPicked(entry); else setPicked(entry);
+    const entry = { name, type: a.mimeType || 'image/jpeg', uri: await adoptIntoTmp(a.uri, name) }; // b70 (VAR-03)
+    if (forHidden) setHiddenPicked((old) => { if (old) void deleteQuietly(old.uri); return entry; }); else setPicked((old) => { if (old) void deleteQuietly(old.uri); return entry; });
   }
 
   async function pickFromDocuments(forHidden: boolean): Promise<void> {
@@ -432,11 +460,14 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
     if (r.canceled) return;
     const f = r.assets?.[0];
     if (!f) return;
-    const entry = { name: f.name || 'file.bin', type: f.mimeType || 'application/octet-stream', uri: f.uri };
-    if (forHidden) setHiddenPicked(entry); else setPicked(entry);
+    const entry = { name: f.name || 'file.bin', type: f.mimeType || 'application/octet-stream', uri: await adoptIntoTmp(f.uri, f.name || 'file.bin') }; // b70 (VAR-03)
+    if (forHidden) setHiddenPicked((old) => { if (old) void deleteQuietly(old.uri); return entry; }); else setPicked((old) => { if (old) void deleteQuietly(old.uri); return entry; });
   }
 
   async function createVault(): Promise<void> {
+    // b70 (audit PRIM-2): both passphrases must be long enough to resist offline guessing
+    const weak = (pass ? passphraseProblem(pass) : null) ?? (hiddenPass ? passphraseProblem(hiddenPass) : null);
+    if (weak) { Alert.alert('Vault', weak); return; }
     if (!name.trim() || !pass || !picked) {
       Alert.alert('Vault', 'Name, passphrase and a file are required.');
       return;
@@ -467,6 +498,8 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
       const rec = vaultRecord(seed ? await sealVaultName(seed, name.trim()) : 'Vault', uri, byteLength);
       if (veilId) rec.owner_veil_id = veilId; // b101: own-side identity tag (ghost filter)
       await app.relay.entityCreate('VeilVault', rec);
+      // b70 (VAR-03): the picked plaintext (decoy and hidden) is deleted once sealed
+      await deleteQuietly(picked.uri); await deleteQuietly(hiddenPicked?.uri);
       setStage(null); setName(''); setPass(''); setHiddenPass(''); setPicked(null); setHiddenPicked(null);
       setShowCreate(false);
       refresh();
@@ -535,6 +568,9 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
       }
       setBusyNote('Unlocking — checking your passphrase');
       const res = await openVaultContainer(container, pw, row.kdf);
+      // audit VAR-16: the job is done — its hold ends BEFORE the contents are shown, so a phone left
+      // untouched through the job locks first (the App checks the inactivity rule as the hold ends)
+      releaseLock();
       // b139 quality gate: a successful vault open is the activation event for
       // vault users (first retrieval, once per install).
       try { await noteVaultRetrieved(app.relay, app.storage); } catch { /* never a blocker */ }
@@ -548,7 +584,7 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
       }
       const files: VaultFileEntry[] = res.manifest.files || [];
       if (!files.length) {
-        void ask({ title: `Opened the ${res.partition === 'hidden' ? 'hidden' : 'decoy'} volume`, message: 'This volume is empty.', info: true });
+        void ask({ title: 'Vault opened', message: 'This vault is empty.', info: true }); // b75 (audit VS-3): neutral
       } else {
         onContents({ partition: res.partition, files });
       }
@@ -571,13 +607,19 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
   async function deleteVault(row: VaultRow): Promise<void> {
     const ok = await ask({
       title: 'Delete vault?',
-      message: `"${row.name}" will be removed from your list. The encrypted blob becomes unreferenced (web parity: it is never deleted server-side).`,
+      message: `"${row.name}" and its encrypted file are deleted from Vardum’s server. The server’s storage and backups can keep an encrypted copy for up to about 15 days; nobody can open it without the passphrase.`,
       confirm: true,
       danger: true,
     });
     if (!ok) return;
     setBusy(true);
-    try { await app.relay.entityDelete('VeilVault', row.id); refresh(); } catch (e) { setErr(friendlyError(e, 'tool')); }
+    try {
+      await app.relay.entityDelete('VeilVault', row.id);
+      // audit VAR-61: the cached 24 MB container and its size note go too (they kept the ciphertext
+      // on this phone for offline passphrase guessing until a wipe)
+      if (row.container_uri) await deleteVaultCache(row.container_uri);
+      refresh();
+    } catch (e) { setErr(friendlyError(e, 'tool')); }
     setBusy(false);
   }
 
@@ -607,27 +649,27 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
               <TextInput style={styles.fieldIn} value={name} onChangeText={setName} placeholder="e.g. Travel documents" placeholderTextColor="#5E6464" />
             </View>
             <View style={styles.field}>
-              <Text style={styles.fieldLbl}>Decoy passphrase</Text>
-              <TextInput style={styles.fieldIn} value={pass} onChangeText={setPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* iOS offers "Use Strong Password" on two password fields even with textContentType none; oneTimeCode suppresses it */ /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="For the volume you can show" placeholderTextColor="#5E6464" />
+              <Text style={styles.fieldLbl}>Passphrase</Text>
+              <TextInput style={styles.fieldIn} value={pass} onChangeText={setPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* iOS offers "Use Strong Password" on two password fields even with textContentType none; oneTimeCode suppresses it */ /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="12+ characters" placeholderTextColor="#5E6464" />
             </View>
             <TouchableOpacity style={[styles.gRow, styles.gRowLast]} onPress={() => { void pickFile(false); }}>
               <View style={styles.gRowMid}>
-                <Text style={picked ? styles.gRowLabel : styles.gRowAccent}>{picked ? picked.name : 'Add the decoy file'}</Text>
-                <Text style={styles.gRowSub}>{picked ? 'Decoy file — tap to change' : 'From Photos or Files, up to 8 MB'}</Text>
+                <Text style={picked ? styles.gRowLabel : styles.gRowAccent}>{picked ? picked.name : 'Add a file'}</Text>
+                <Text style={styles.gRowSub}>{picked ? 'Tap to change' : 'From Photos or Files, up to 8 MB'}</Text>
               </View>
               <Text style={styles.chev}>›</Text>
             </TouchableOpacity>
           </View>
-          <Text style={styles.groupTitle}>Hidden volume (optional)</Text>
+          <Text style={styles.groupTitle}>Second volume (optional)</Text>
           <View style={styles.group}>
             <View style={styles.field}>
-              <Text style={styles.fieldLbl}>Hidden passphrase</Text>
-              <TextInput style={styles.fieldIn} value={hiddenPass} onChangeText={setHiddenPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* iOS offers "Use Strong Password" on two password fields even with textContentType none; oneTimeCode suppresses it */ /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="A different passphrase" placeholderTextColor="#5E6464" />
+              <Text style={styles.fieldLbl}>Second passphrase</Text>
+              <TextInput style={styles.fieldIn} value={hiddenPass} onChangeText={setHiddenPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* iOS offers "Use Strong Password" on two password fields even with textContentType none; oneTimeCode suppresses it */ /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="A different one, 12+ characters" placeholderTextColor="#5E6464" />
             </View>
             <TouchableOpacity style={[styles.gRow, styles.gRowLast]} onPress={() => { void pickFile(true); }}>
               <View style={styles.gRowMid}>
-                <Text style={hiddenPicked ? styles.gRowLabel : styles.gRowAccent}>{hiddenPicked ? hiddenPicked.name : 'Add the hidden file'}</Text>
-                <Text style={styles.gRowSub}>{hiddenPicked ? 'Hidden file — tap to change' : 'Opens only with the hidden passphrase'}</Text>
+                <Text style={hiddenPicked ? styles.gRowLabel : styles.gRowAccent}>{hiddenPicked ? hiddenPicked.name : 'Add a file'}</Text>
+                <Text style={styles.gRowSub}>{hiddenPicked ? 'Tap to change' : 'Opens only with the second passphrase'}</Text>
               </View>
               <Text style={styles.chev}>›</Text>
             </TouchableOpacity>
@@ -661,7 +703,19 @@ function VaultsView({ app, veilId, ask, choose, onShowFile, onContents }: {
 
 /* -------------------------------- Notes -------------------------------- */
 
-function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
+/** b75 round 2 (audit D4): the relay calls the notes marks manifest needs */
+function notesManifestDeps(app: VeilApp, veilId?: string | null) {
+  return {
+    listRows: async () => {
+      const data = (await app.relay.entityList('VeilNote', { sort: '-updated_date', limit: 100 })) as { data?: NoteRow[] } | NoteRow[];
+      return (Array.isArray(data) ? data : (data.data ?? [])) as Array<NoteRow & { payload_ciphertext: string; payload_iv: string }>;
+    },
+    updateRow: (id: string, rec: Record<string, unknown>) => app.relay.entityUpdate('VeilNote', id, rec),
+    createRow: (rec: Record<string, unknown>) => app.relay.entityCreate('VeilNote', { ...rec, ...(veilId ? { owner_veil_id: veilId } : {}) }),
+  };
+}
+
+function NotesView({ app, veilId, privateKeyboard = false }: { app: VeilApp; veilId?: string | null; privateKeyboard?: boolean }) {
   const [rows, setRows] = useState<NoteRow[]>([]);
   const [decrypted, setDecrypted] = useState<Record<string, NotePayload>>({});
   const [err, setErr] = useState<string | null>(null);
@@ -679,7 +733,8 @@ function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
       const data = (await app.relay.entityList('VeilNote', { sort: '-updated_date', limit: 100 })) as { data?: NoteRow[] } | NoteRow[];
       const all = Array.isArray(data) ? data : (data.data ?? []);
       // b101 ghost-row filter — see src/owner-veil-filter.ts
-      const list = visibleUnderIdentity(all, veilId);
+      // b75 round 2 (audit D4): the marks manifest is a note row too, never shown as a note
+      const list = visibleUnderIdentity(all, veilId).filter((r) => !app.notes.isManifest(noteMetaOf(r)));
       setRows(list);
       const dec: Record<string, NotePayload> = {};
       for (const r of list) {
@@ -688,6 +743,8 @@ function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
         }
       }
       setDecrypted(dec);
+      // b75 round 2 (audit D4): newer versions seen here go to the relay's marks manifest
+      void syncNotesManifest(app.notes, notesManifestDeps(app, veilId), all as never);
     } catch (e) {
       setErr(friendlyError(e, 'tool'));
     }
@@ -739,7 +796,7 @@ function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
     <View style={styles.sect}>
       <ToolHeader
         title="Notes"
-        sub="Private notes, end-to-end encrypted. Only ciphertext reaches the server; the key never leaves this device."
+        sub="Private notes, encrypted on this phone. Only ciphertext reaches the server; the key never leaves this device."
         action={showCreate || editing ? 'Cancel' : '＋ New'}
         onAction={() => { if (showCreate || editing) closeEditor(); else setShowCreate(true); }}
       />
@@ -749,10 +806,10 @@ function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
           <Text style={styles.groupTitle}>{editing ? 'Edit note' : 'New note'}</Text>
           <View style={styles.group}>
             <View style={styles.field}>
-              <TextInput style={[styles.fieldIn, styles.fieldTitle]} value={title} onChangeText={setTitle} placeholder="Title" placeholderTextColor="#5E6464" />
+              <TextInput style={[styles.fieldIn, styles.fieldTitle]} value={title} onChangeText={setTitle} placeholder="Title" placeholderTextColor="#5E6464" {...privateComposerProps(privateKeyboard)} />
             </View>
             <View style={[styles.field, styles.gRowLast]}>
-              <TextInput style={[styles.fieldIn, styles.fieldBody]} value={body} onChangeText={setBody} multiline textAlignVertical="top" placeholder="Write privately…" placeholderTextColor="#5E6464" />
+              <TextInput style={[styles.fieldIn, styles.fieldBody]} value={body} onChangeText={setBody} multiline textAlignVertical="top" placeholder="Write privately…" placeholderTextColor="#5E6464" {...privateComposerProps(privateKeyboard)} />
             </View>
           </View>
           <TouchableOpacity style={styles.primary} onPress={saveNote} disabled={busy}>
@@ -786,7 +843,7 @@ function NotesView({ app, veilId }: { app: VeilApp; veilId?: string | null }) {
 
 /* -------------------------------- Stego -------------------------------- */
 
-function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage']; choose: (spec: import('./ThemedSheets').ChooserSpec) => Promise<number | null>; onEmbedded: (item: ViewerItem) => void }) {
+function StegoView({ storage, choose, onEmbedded, privateKeyboard = false }: { storage?: VeilApp['storage']; choose: (spec: import('./ThemedSheets').ChooserSpec) => Promise<number | null>; onEmbedded: (item: ViewerItem) => void; privateKeyboard?: boolean }) {
   const { node: stegoPromptNode, ask: stegoAsk } = useThemedPrompt();
   const [mode, setMode] = useState<'embed' | 'extract' | 'selftest'>('embed');
   const [message, setMessage] = useState('');
@@ -801,7 +858,7 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
     if (r.canceled) return null;
     const a = r.assets?.[0];
     if (!a?.uri) return null;
-    return { uri: a.uri, name: a.fileName || 'stego.png', w: a.width, h: a.height };
+    return { uri: await adoptIntoTmp(a.uri, a.fileName || 'stego.png'), name: a.fileName || 'stego.png', w: a.width, h: a.height }; // b70 (VAR-03)
   }
 
   /** carrier from the Files app (image only — same lazy-require pattern). */
@@ -817,7 +874,7 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
     if (r.canceled) return null;
     const f = (r as { assets?: { uri: string; name?: string }[] }).assets?.[0];
     if (!f?.uri) return null;
-    return { uri: f.uri, name: f.name || 'carrier.png' };
+    return { uri: await adoptIntoTmp(f.uri, f.name || 'carrier.png'), name: f.name || 'carrier.png' }; // b70 (VAR-03)
   }
 
   /**
@@ -844,6 +901,8 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
   async function embed(): Promise<void> {
     setErr(null); setResult(null);
     if (!message.trim()) { setErr('Write the message first.'); return; }
+    // b70 (audit PRIM-2): an optional passphrase, but a real one when given
+    if (pass.trim() && passphraseProblem(pass.trim())) { setErr(passphraseProblem(pass.trim())); return; }
     setBusy(true);
     try {
       const carrier = await pickCarrierThemed('embed');
@@ -896,21 +955,32 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
         [{ resize: { width: targetW, height: targetH } } as unknown as import('expo-image-manipulator').Action],
         { format: ImageManipulator.SaveFormat.PNG, compress: 1 },
       );
-      const pngBytes = await readFileBytes(norm.uri);
+      // b77u (audit 6 W11 / IH full L-11): the manipulator's outputs (cache/ImageManipulator/, the clean cover a
+      // diff against the shared image would expose) are deleted as soon as they are read
+      const manipOut: string[] = [norm.uri];
       let img: ReturnType<typeof decodePng>;
       try {
-        img = decodePng(pngBytes);
-      } catch (decErr) {
-        // Extremely defensive fallback: if some device/OS combo still hands
-        // back a non-8-bit PNG even after a forced resize, re-run through a
-        // lossy JPEG bounce (JPEG is always 8-bit) before the final PNG pass
-        // rather than failing the embed outright.
-        const bounced = await ImageManipulator.manipulateAsync(norm.uri, [], { format: ImageManipulator.SaveFormat.JPEG, compress: 0.98 });
-        const rePng = await ImageManipulator.manipulateAsync(bounced.uri, [], { format: ImageManipulator.SaveFormat.PNG, compress: 1 });
-        const rePngBytes = await readFileBytes(rePng.uri);
-        img = decodePng(rePngBytes);
+        const pngBytes = await readFileBytes(norm.uri);
+        try {
+          img = decodePng(pngBytes);
+        } catch (decErr) {
+          // Extremely defensive fallback: if some device/OS combo still hands
+          // back a non-8-bit PNG even after a forced resize, re-run through a
+          // lossy JPEG bounce (JPEG is always 8-bit) before the final PNG pass
+          // rather than failing the embed outright.
+          const bounced = await ImageManipulator.manipulateAsync(norm.uri, [], { format: ImageManipulator.SaveFormat.JPEG, compress: 0.98 });
+          manipOut.push(bounced.uri);
+          const rePng = await ImageManipulator.manipulateAsync(bounced.uri, [], { format: ImageManipulator.SaveFormat.PNG, compress: 1 });
+          manipOut.push(rePng.uri);
+          const rePngBytes = await readFileBytes(rePng.uri);
+          img = decodePng(rePngBytes);
+        }
+      } finally {
+        for (const u of manipOut) await deleteQuietly(u);
       }
-      lsbEmbed(img.rgba, await buildStegoStream(message, pass.trim() || null, img.rgba.length)); // Batch E (F-7)
+      // Batch E (F-7): the room is checked first. b75 (audit VS-1): with a passphrase only the
+      // bits needed, at passphrase-keyed places, by +-1 matching
+      await embedStego(img.rgba, message, pass.trim() || null);
       const out = encodePng(img);
       const viaFolder = usesFolderPicker();
       let saved: string | undefined;
@@ -918,7 +988,7 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
         // b69 Android: "Save to…" through the system folder picker, no gallery
         // permission. The folder grant persists, so the duress wipe can still
         // delete this file (src/saved-media.ts).
-        const uri = await withSystemSheet(() => saveToChosenFolder(bytesToB64(out), `vardum-stego-${Date.now()}.png`, 'image/png'));
+        const uri = await withSystemSheet(() => saveToChosenFolder(bytesToB64(out), neutralImageName(), 'image/png') /* b75 (audit VS-1): a neutral name */);
         if (!uri) { setErr('Not saved. Choose a folder to save the stego image.'); setBusy(false); return; }
         saved = uri;
       } else {
@@ -929,28 +999,23 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
         // Full access keeps the duress purge able to delete veil_saved_media.
         const perm = await withSystemSheet(() => MediaLibrary.requestPermissionsAsync(false));
         if (!perm.granted) { setErr('Photos access is required to save (and later purge under a duress wipe) the stego image.'); setBusy(false); return; }
-        const path = `${FileSystem.cacheDirectory}veil-stego-${Date.now()}.png`;
+        const path = `${FileSystem.cacheDirectory}${neutralImageName()}`; // b75 (audit VS-1): Photos keeps this name
         await FileSystem.writeAsStringAsync(path, bytesToB64(out), { encoding: FileSystem.EncodingType.Base64 });
-        saved = (await MediaLibrary.saveToLibraryAsync(path)) as unknown as string | undefined;
+        // b70 (re-review 4): createAssetAsync returns the asset (saveToLibraryAsync returns
+        // nothing, so the image was never recorded and no wipe deleted it)
+        saved = (await MediaLibrary.createAssetAsync(path))?.id;
         await FileSystem.deleteAsync(path, { idempotent: true });
       }
       // (b64) track the Photos asset id (b69: or the Android file URI) — the duress wipe deletes these so
       // stego images don't outlive the device data they belong to.
-      try {
-        if (saved && storage) {
-          const raw = await storage.get('veil_saved_media');
-          const arr = raw ? (JSON.parse(raw) as string[]) : [];
-          arr.push(String(saved));
-          await storage.set('veil_saved_media', JSON.stringify(arr));
-        }
-      } catch { /* tracking is best-effort */ }
-      setResult(`Stego image saved ${viaFolder ? 'to the folder you chose' : 'to Photos'}. Send it like any picture — the words travel inside, invisible. Do not re-upload through apps that recompress.`);
+      await trackSavedMedia(storage, saved ? String(saved) : null); // b70 (re-review 10): queued and retried
+      setResult(`Stego image saved ${viaFolder ? 'to the folder you chose' : 'to Photos (a wipe deletes it, but iOS asks first and keeps it in Recently Deleted for 30 days)'}. Send it like any picture — the words travel inside, invisible. Do not re-upload through apps that recompress.`);
       // show the result right here so it can be viewed, not just saved
       onEmbedded({
-        name: `stego-${Date.now()}.png`,
+        name: neutralImageName(),
         mime: 'image/png',
         bytes: out,
-        note: `${viaFolder ? 'Saved to the folder you chose' : 'Saved to Photos'}. Looks like the original picture — the message is inside.`,
+        note: `${viaFolder ? 'Saved to the folder you chose' : 'Saved to Photos'}. Looks like the original picture — the message is inside (to the eye; see the note below).`,
       });
       // AUDIT FIX (Sept 19): the passphrase (and message) stayed in the boxes
       // after a successful embed — a shoulder-surf/screen-lock risk once the
@@ -977,7 +1042,16 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
       if (pngBytes.length < 8 || pngBytes[0] !== 0x89 || pngBytes[1] !== 0x50 || pngBytes[2] !== 0x4e || pngBytes[3] !== 0x47) {
         throw new Error('That file is not a lossless PNG. Photos or another app recompressed it (JPEG/HEIC) and the hidden data cannot survive compression. Pick the original stego PNG.');
       }
-      const img = decodePng(pngBytes); // stego output is always PNG (lossless)
+      // b77s (audit 4 DV-3): a small PNG can declare a huge image (a 155 KB file decoded to 320 MB of
+      // buffers at the decoder's 40 MP cap). Hide never writes more than 2048 px a side (about 4.2 MP),
+      // so Extract refuses anything over STEGO_EXTRACT_MAX_PIXELS before allocating, with its own sentence
+      let img: ReturnType<typeof decodePng>;
+      try {
+        img = decodePng(pngBytes, { maxPixels: STEGO_EXTRACT_MAX_PIXELS }); // stego output is always PNG (lossless)
+      } catch (e) {
+        if (/the image is too large/i.test(String((e as Error)?.message ?? e))) { setErr(STEGO_EXTRACT_TOO_LARGE); return; }
+        throw e;
+      }
       let msg: string;
       try {
         msg = await extractStego(img.rgba, pass.trim() || null);
@@ -998,7 +1072,7 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
   }
 
   /** (b69) owner ask: save the extracted payload ENCRYPTED on device.
-   *  AES-256-GCM with a locally-derived key (PBKDF2-SHA256, 210k) — the
+   *  AES-256-GCM with a locally-derived key (PBKDF2-SHA256, 600k since b70) — the
    *  plaintext never touches the disk or the share sheet unless asked. */
   async function saveResultEncrypted(): Promise<void> {
     if (!result) return;
@@ -1009,16 +1083,22 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
       submitLabel: 'Save encrypted',
     })) as string | null;
     if (!pw) return;
+    // b70 (audit PRIM-2)
+    const weak = passphraseProblem(pw);
+    if (weak) { Alert.alert('Save encrypted copy', weak); return; }
     setBusy(true);
     try {
       const salt = randomBytes(16);
       const iv = randomBytes(12);
-      const key = await deriveVaultKey(pw, toB64(salt), LOCK_CODE_PBKDF2_ITERATIONS);
+      // b70 (audit PRIM-2): the vault-strength cost (600k), not the lock code's;
+      // the count is stored in the file, so older exports still open
+      const key = await deriveVaultKey(pw, toB64(salt), VAULT_PBKDF2_ITERATIONS_NEW);
       const ct = await vaultEncrypt(key, iv, utf8(result));
-      const blob = utf8(JSON.stringify({ v: 1, salt: toB64(salt), iv: toB64(iv), iters: LOCK_CODE_PBKDF2_ITERATIONS, ct: toB64(ct) }));
+      const blob = utf8(JSON.stringify({ v: 1, salt: toB64(salt), iv: toB64(iv), iters: VAULT_PBKDF2_ITERATIONS_NEW, ct: toB64(ct) }));
       const name = `veil-extract-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.veilenc`;
       const path = `${FileSystem.documentDirectory}${name}`;
       await FileSystem.writeAsStringAsync(path, toB64(blob), { encoding: FileSystem.EncodingType.Base64 });
+      await excludeFromBackup(path); // b70 (L-5): never into iCloud / device backups
       Alert.alert('Saved encrypted', `${name}\nAES-256-GCM, encrypted on this device.\nOpen it later from Stego → Extract → Open encrypted file.`);
     } catch (e) {
       Alert.alert('Save failed', String((e as Error).message || e));
@@ -1049,6 +1129,8 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
     setBusy(true);
     try {
       const b64 = await FileSystem.readAsStringAsync(file.uri, { encoding: FileSystem.EncodingType.Base64 });
+      await deleteQuietly(file.uri); // b70 (VAR-03): the picker's copy
+      await dropPickerInbox(); // b77u (audit 6 U-M6): and the iOS picker's Inbox original
       const rec = JSON.parse(new TextDecoder().decode(fromB64(b64))) as { salt: string; iv: string; iters: number; ct: string };
       const key = await deriveVaultKey(pw, rec.salt, rec.iters);
       const pt = await vaultDecrypt(key, fromB64(rec.iv), fromB64(rec.ct));
@@ -1089,14 +1171,14 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
           <Text style={styles.groupTitle}>Hide a message</Text>
           <View style={styles.group}>
             <View style={styles.field}>
-              <TextInput style={[styles.fieldIn, styles.fieldBody]} value={message} onChangeText={setMessage} multiline textAlignVertical="top" placeholder="The words to hide (up to 256 KB)" placeholderTextColor="#5E6464" />
+              <TextInput style={[styles.fieldIn, styles.fieldBody]} value={message} onChangeText={setMessage} multiline textAlignVertical="top" placeholder="The words to hide (up to 256 KB)" placeholderTextColor="#5E6464" {...privateComposerProps(privateKeyboard)} />
             </View>
             <View style={[styles.field, styles.gRowLast]}>
               <Text style={styles.fieldLbl}>Passphrase (optional)</Text>
-              <TextInput style={styles.fieldIn} value={pass} onChangeText={setPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="Adds encryption" placeholderTextColor="#5E6464" />
+              <TextInput style={styles.fieldIn} value={pass} onChangeText={setPass} secureTextEntry autoCapitalize="none" autoCorrect={false} spellCheck={false} autoComplete="off" importantForAutofill="no" textContentType="oneTimeCode" /* b199: Android capitalised the first letter (Test1234 vs test1234) — passphrases are typed exactly */ placeholder="Adds encryption (12+ characters)" placeholderTextColor="#5E6464" />
             </View>
           </View>
-          <Text style={styles.groupNote}>With a passphrase it is also encrypted; without one it is still not visible to the eye. Honest limit: this hides the message from a casual viewer — resistance to steganalysis tools is not claimed. Only lossless PNG survives.</Text>
+          <Text style={styles.groupNote}>With a passphrase the message is encrypted and its bits are scattered over the image at places only the passphrase picks, so it can't be read, located or sized without it. Without a passphrase it is hidden from the eye only: anyone with Vardum, or a simple tool, can find and read it. A careful statistical test may still tell that the picture was changed. Resistance to statistical steganalysis is not claimed. Only lossless PNG survives.</Text>
           <TouchableOpacity style={styles.primary} onPress={embed} disabled={busy}><Text style={styles.primaryTxt}>{busy ? 'Working…' : 'Choose image & hide'}</Text></TouchableOpacity>
         </>
       ) : mode === 'extract' ? (
@@ -1142,8 +1224,13 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
         <>
           <Text style={styles.groupTitle}>Hidden message</Text>
           <View style={styles.group}>
-            <Text selectable style={styles.resultTxt}>{result}</Text>
+            {/* b77q (audit 3 AP-3): not selectable (an OS copy had no sensitive flag and was never
+                cleared); the Copy button marks it sensitive and clears it after a minute */}
+            <Text style={styles.resultTxt}>{result}</Text>
           </View>
+          <TouchableOpacity style={styles.secondary} onPress={() => { copySensitive(result).catch(() => undefined); }} disabled={busy}>
+            <Text style={styles.secondaryTxt}>Copy (cleared after a minute)</Text>
+          </TouchableOpacity>
           <TouchableOpacity style={styles.secondary} onPress={saveResultEncrypted} disabled={busy}>
             <Text style={styles.secondaryTxt}>Save encrypted to device</Text>
           </TouchableOpacity>

@@ -318,3 +318,42 @@ export function parseVeilAddLink(raw: string): string | null {
   const m = String(raw || '').match(/[?&]add=([1-9A-HJ-NP-Za-km-z]{8,64})(?:[&#]|$)/);
   return m ? m[1] : null;
 }
+
+/**
+ * audit VAR-40 (1f51): the only links Vardum acts on when the OS opens it: https://tryveil.app (and,
+ * b77s, https://tryvardum.app)
+ * links (iOS associated domain, Android autoVerify intent filter). The veil:// custom scheme is
+ * gone (app.json); any other scheme a build may still register (a development client's own) is
+ * ignored.
+ * b77q (audit 3 AP-4): this does NOT tell who sent the link. Verification only decides which app
+ * the OS picks for a tapped link: any installed app can start Vardum with an explicit intent (or
+ * open the universal link) carrying a tryveil.app URL of its choosing. Every accepted link is
+ * therefore untrusted input: nothing reaches the relay until the user taps (an add link only
+ * fills in the ID; an invite asks "Join this…?" first).
+ */
+export function trustedAppLink(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string' || raw.length > 4096) return null;
+  return APP_LINK_RE.test(raw) ? raw : null;
+}
+
+/** b77s (owner decision "add tryvardum.app"): the app-link hosts. https://tryvardum.app links are
+ *  accepted exactly like https://tryveil.app ones (app.json: iOS associated domain + Android autoVerify
+ *  filter for both). Vardum still GENERATES tryveil.app links (veilAddLink, invites): older builds
+ *  accept only those. Exact hosts only — no subdomain, no other scheme, no port. */
+export const APP_LINK_HOSTS: readonly string[] = Object.freeze(['tryveil.app', 'tryvardum.app']);
+const APP_LINK_RE = /^https:\/\/(?:tryveil|tryvardum)\.app\/(?:[?#]|$)/;
+/** the app link inside a longer text (an invite handoff): https://<app host>/?… */
+export const APP_LINK_IN_TEXT_RE = /https:\/\/(?:tryveil|tryvardum)\.app\/\?[^\s"']*/;
+
+/** b77q (audit 3 DV-3): the app routes a link to the group join only when it carries g=. A 1:1
+ *  link is joined with any t= (a group seat's id) dropped, so an inviter who appends `&t=…` can't
+ *  turn the anonymous 1:1 join into a signed-in seat join that names this phone's account. */
+export function oneToOneInviteLink(link: string): string {
+  return String(link).replace(/([#&])t=[^&#\s]*&?/gi, '$1').replace(/[#&]$/, '');
+}
+
+/** b77q (audit 3 AQ-4): what joining a group discloses, shown before EVERY group join (a link
+ *  opened from outside and the in-chat invitation card alike) */
+export const GROUP_JOIN_NOTE = 'Joining asks the group creator to let you in. Once in, your Vardum ID, identity key and nickname are shared with the group’s members; Vardum’s server also sees your Vardum ID on the group’s list, and the group is linked to your account. Only join links you trust.';
+/** b77q (audit 3 AP-4): added to a confirmation an incoming link raised */
+export const LINK_FROM_OUTSIDE_NOTE = 'This link was opened from outside Vardum. Any app on this phone can open one, so check you meant to.';

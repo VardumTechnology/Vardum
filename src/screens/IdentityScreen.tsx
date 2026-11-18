@@ -1,10 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Platform, ActivityIndicator, Image, Alert} from 'react-native';
 import { useKbPadding } from '../hooks/useKbPadding';
+import { clearPhraseFromClipboard, pastePhraseFromClipboard } from '../clipboard-guard';
+import { SecureInput, SecureKeypadHost } from '../components/SecureKeypad'; // b77n (owner, 30 Oct): the 24 words on the Vardum keypad
 import { startScreenWatch } from '../screen-watch';
 import { validatePhrase } from '../../vendor/crypto-core/src/index';
 import { canonicalPhrase } from '../../vendor/device/src/silent-auth';
 import { PERMISSION_DECLINED } from '../platformText';
+import { RESTORE_FLAG_SAVE_FAILED } from '../restore-password'; // b77g (G-2)
+import { regLockPromptText, regLockPinProblem, REGLOCK_PIN_MAX, REGLOCK_PIN_MIN, type RegLockInfo } from '../../vendor/device/src/reglock';
 
 
 
@@ -21,6 +25,14 @@ export interface IdentityScreenProps {
   onAccountSignIn?: () => void;
   /** Entry point — 'confirm-create' for Settings > "Generate new Veil ID" (skips the chooser). */
   initialMode?: 'choose' | 'confirm-create';
+  /** b76 (registration lock): set while the relay holds this restore for the lock's PIN */
+  regLock?: RegLockInfo | null;
+  /** b76 (registration lock): try the PIN (a wrong one just updates `regLock`) */
+  onRegLockPin?: (pin: string) => Promise<void>;
+  /** b76 (registration lock): back out — nothing is restored */
+  onRegLockCancel?: () => void;
+  /** b77 rollout: shown at the top of the first screen after an update moved this phone off the older relay */
+  notice?: { title: string; text: string } | null;
 }
 
 /**
@@ -34,6 +46,10 @@ export interface IdentityScreenProps {
  * exception text goes to the Metro console; the UI gets one human sentence.
  */
 function friendlyError(e: unknown, what: string): string {
+  // b71: the set-up's own plain messages are shown as written (they name the stalled step)
+  const raw = String((e as Error)?.message ?? e);
+  if (/taking too long|still starting up|identity was lost/i.test(raw)) return raw;
+  if (raw === RESTORE_FLAG_SAVE_FAILED) return raw; // b77g (G-2): the restore's flag-save refusal says what happened
   const err = e as Error;
   console.log(`[veil-error] ${what}:`, String(err?.message ?? e), err?.stack ?? '');
   const s = String(err?.message ?? e).toLowerCase();
@@ -51,7 +67,70 @@ function friendlyError(e: unknown, what: string): string {
   return 'Something went wrong — please try again.';
 }
 
-export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut, onAccountSignIn, initialMode = 'choose' }: IdentityScreenProps) {
+/**
+ * b76 (registration lock): the restore's PIN step. The words were right, but the account is locked
+ * to its own phone until it lapses; the PIN (with the words) gets past it. Says when the lock
+ * lapses for someone who doesn't know the PIN, and how many tries are left.
+ */
+function RegLockStep({ info, onPin, onCancel }: { info: RegLockInfo; onPin: (pin: string) => Promise<void>; onCancel: () => void }) {
+  const kbH = useKbPadding();
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 30_000); return () => clearInterval(t); }, []);
+  const waiting = !info.lockedOut && info.retryAt > now + 1000;
+  const submit = async () => {
+    if (!pin || busy) return;
+    // a registration lock PIN always has REGLOCK_PIN_MIN characters or more: a shorter entry is
+    // wrong for sure, and is not sent (no try is spent on it)
+    if (regLockPinProblem(pin)) { setError(`That isn’t the PIN: a registration lock PIN has at least ${REGLOCK_PIN_MIN} characters. No try was used.`); return; }
+    setBusy(true); setError(null);
+    try { await onPin(pin); setPin(''); } catch (e) { setError(friendlyError(e, 'reglock')); } finally { setBusy(false); setNow(Date.now()); }
+  };
+  return (
+    <View style={styles.fill}>
+      <ScrollView contentContainerStyle={[styles.welcomePage, kbH > 0 ? { paddingBottom: kbH + 24 } : null]} keyboardShouldPersistTaps="handled">
+        <View style={styles.welcomeTop}>
+          <Image source={require('../../assets/logo.png')} style={styles.pageLogo} />
+          <Text style={styles.welcomeH1}>Registration lock</Text>
+          <Text style={styles.welcomeH2}>
+            Your 24 words are right, but this account has a registration lock. Enter the PIN you chose on your old phone to restore it here.
+          </Text>
+        </View>
+        <View style={styles.welcomeChoices}>
+          <TextInput
+            style={[styles.input, styles.pinInput]}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            placeholder="Registration lock PIN"
+            placeholderTextColor="#5E6464"
+            maxLength={REGLOCK_PIN_MAX}
+            value={pin}
+            editable={!busy && !info.lockedOut}
+            onChangeText={(t) => { setPin(t); setError(null); }}
+            accessibilityLabel="Registration lock PIN"
+          />
+          <Text style={styles.regLockNote}>{regLockPromptText(info, now)}</Text>
+          {error ? <Text style={styles.error}>{error}</Text> : null}
+          {busy ? (
+            <ActivityIndicator color="#FFFFFF" style={styles.busy} />
+          ) : (
+            <TouchableOpacity style={[styles.cta, (!pin || info.lockedOut || waiting) && styles.ctaDisabled]} disabled={!pin || info.lockedOut || waiting} onPress={submit}>
+              <Text style={styles.ctaText}>Restore identity</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+        <TouchableOpacity style={styles.welcomeSignOut} onPress={onCancel} disabled={busy}>
+          <Text style={styles.welcomeSignOutTxt}>← Back</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
+  );
+}
+
+export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut, onAccountSignIn, initialMode = 'choose', regLock, onRegLockPin, onRegLockCancel, notice }: IdentityScreenProps) {
   const kbH = useKbPadding();
   const [mode, setMode] = useState<'choose' | 'restore' | 'confirm-create' | 'reveal' | 'provisioning'>(initialMode);
   const [phraseInput, setPhraseInput] = useState('');
@@ -93,9 +172,12 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
       setMode('reveal');
       setWritten(false);
     } catch (e) {
-      const msg = String((e as Error).message || e) + '\n\n' + String((e as Error).stack || '').slice(0, 400);
-      setError(msg);
-      try { Alert.alert('Vardum error — photograph this screen', msg); } catch { /* Alert optional */ }
+      // audit VAR-43 (1f51): the message and stack only in development builds; release shows one plain sentence
+      if (__DEV__) {
+        const msg = String((e as Error).message || e) + '\n\n' + String((e as Error).stack || '').slice(0, 400);
+        setError(msg);
+        try { Alert.alert('Vardum error — photograph this screen', msg); } catch { /* Alert optional */ }
+      } else setError(friendlyError(e, 'create'));
     } finally { setBusy(false); }
   };
 
@@ -122,6 +204,7 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
       setBusy(false);
       return;
     }
+    void clearPhraseFromClipboard(canonical); // audit VAR-08: a pasted phrase doesn't stay on the clipboard
     try {
       await onRestore(canonical);
     } catch (e) {
@@ -130,6 +213,12 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
     }
   };
 
+
+  // b76 (registration lock): the restore that hit the lock stays "busy" until the PIN step closes
+  useEffect(() => { if (!regLock) setBusy(false); }, [regLock]);
+  if (regLock && onRegLockPin) {
+    return <RegLockStep info={regLock} onPin={onRegLockPin} onCancel={() => { onRegLockCancel?.(); setMode('restore'); }} />;
+  }
 
   if (mode === 'choose') {
     return (
@@ -148,6 +237,13 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
           </View>
 
           <View style={styles.welcomeChoices}>
+          {/* b77 rollout: a card, not an Alert (an Alert raised during start-up can be dropped under the privacy cover) */}
+          {notice ? (
+            <View style={styles.tipCard} accessibilityRole="alert">
+              <Text style={styles.tipTitle}>{notice.title}</Text>
+              <Text style={styles.tipTxt}>{notice.text}</Text>
+            </View>
+          ) : null}
           <TouchableOpacity style={styles.card} onPress={() => setMode('restore')} disabled={busy}>
             <Text style={styles.cardTitle}>Restore with recovery phrase</Text>
             <Text style={styles.cardBody}>Have your 24 words? Your identity, contacts and pins come back on this device.</Text>
@@ -176,7 +272,7 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
 
   if (mode === 'restore') {
     return (
-      <View style={styles.fill}>
+      <SecureKeypadHost style={styles.fill}>
         {/* b199 (owner, Oct 16): full-page layout, same as the welcome page */}
         <ScrollView contentContainerStyle={[styles.welcomePage, kbH > 0 ? { paddingBottom: kbH + 24 } : null]} keyboardShouldPersistTaps="handled">
           <View style={styles.welcomeTop}>
@@ -188,16 +284,22 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
           </View>
 
           <View style={styles.welcomeChoices}>
-          <TextInput
+          {/* b77n (owner decision, 30 Oct): typed on Vardum's own keypad (phrase layout: a–z, space,
+              BIP39 suggestions from the app's wordlist, a Paste key that clears the clipboard) — no
+              phone keyboard sees the words. The on-device checksum check below is unchanged. */}
+          <SecureInput
+            variant="phrase"
             style={[styles.input, wordCount === 24 && styles.inputOk]}
             multiline
-            autoCapitalize="none"
-            autoCorrect={false}
             placeholder="word word word …"
             placeholderTextColor="#5E6464"
             value={phraseInput}
             editable={!busy}
-            onChangeText={(t) => { setPhraseInput(t.toLowerCase()); setError(null); }}
+            autoFocus
+            stayOpen
+            onChangeText={(t) => { setPhraseInput(t); setError(null); }}
+            onPaste={() => { void pastePhraseFromClipboard().then((p) => { if (p) { setPhraseInput(p); setError(null); } }); }}
+            accessibilityLabel="Recovery phrase"
           />
           <Text style={[styles.counter, wordCount === 24 && styles.counterOk]}>{wordCount} / 24 words</Text>
 
@@ -220,7 +322,7 @@ export function IdentityScreen({ onCreate, onRestore, onFinishCreate, onSignOut,
             <Text style={styles.welcomeSignOutTxt}>← Back</Text>
           </TouchableOpacity>
         </ScrollView>
-      </View>
+      </SecureKeypadHost>
     );
   }
 
@@ -387,5 +489,8 @@ const styles = StyleSheet.create({
   link: { alignItems: 'center', marginTop: 18 },
   linkText: { color: '#FFFFFF', fontSize: 13 },
   error: { color: '#ff8f8f', fontSize: 13, marginTop: 10, lineHeight: 18 },
+  // b76 (registration lock)
+  pinInput: { minHeight: 0, fontSize: 18, letterSpacing: 1 },
+  regLockNote: { color: '#8E9696', fontSize: 13, lineHeight: 19, marginTop: 10, marginBottom: 16 },
   bootText: { color: '#5E6464', marginTop: 14, fontSize: 13, letterSpacing: 1 },
 });

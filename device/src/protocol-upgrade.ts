@@ -1,6 +1,7 @@
 /**
  * @veil/device — one-time protocol upgrade: the hard cut to the current
- * 1:1 protocol (b54 Batch A: veil-ratchet-5; Batch C: veil-ratchet-6).
+ * 1:1 protocol (b54 Batch A: veil-ratchet-5; Batch C: veil-ratchet-6; b74: veil-ratchet-7;
+ * b77: veil-ratchet-8, encrypted header).
  *
  *  - 1:1 sessions whose stored ratchet predates RATCHET_PROTOCOL_LATEST
  *    (ratchet-3/-4: P-256, optional PQ; ratchet-5: no responder-IK term,
@@ -10,7 +11,6 @@
  *  - Private-group MEMBER records from before b54 have no creator IK, so no
  *    rekey could ever be verified: they are marked ended. Creator records
  *    backfill the creator IK (their own) and an empty local deny list.
- *    Lounge / forum records are untouched (they follow their descriptor).
  *
  * Group envelopes need no migration here: Batch C (A2) changes only the
  * per-message signature format, and old-format envelopes are refused on receipt.
@@ -24,7 +24,7 @@ import type { VeilRelay } from './relay';
 import type { SessionStore } from './session-store';
 import { GROUP_KEY_PREFIX, GROUP_SEND_SUFFIX, loadGroupRecord, saveGroupRecord } from './groups';
 
-const MIGRATED_KEY = 'veil_c6_protocol_upgrade'; // Batch C (veil-ratchet-6); was veil_b54_protocol_upgrade
+const MIGRATED_KEY = 'veil_c8_protocol_upgrade'; // b77 (veil-ratchet-8: every ratchet-7 chat ends); was veil_c7b_ (b75, audit RT-5), veil_c7_ (b74), veil_c6_ (Batch C), veil_b54_
 
 export interface ProtocolUpgradeResult { endedChats: number; endedGroups: number; backfilledGroups: number; alreadyDone: boolean }
 
@@ -66,10 +66,13 @@ export async function runProtocolUpgrade(
     const rec = await loadGroupRecord(deps.storage, key.slice(GROUP_KEY_PREFIX.length)).catch(() => null);
     if (!rec || rec.creatorIkPubB64) continue;
     if (rec.role === 'creator') {
-      await saveGroupRecord(deps.storage, { ...rec, creatorIkPubB64: rec.ikPubB64, evictedIks: rec.evictedIks ?? [] });
+      // b75 round 2: change the live record in place (a saved copy could replace it under a concurrent group pass)
+      Object.assign(rec, { creatorIkPubB64: rec.ikPubB64, evictedIks: rec.evictedIks ?? [] });
+      await saveGroupRecord(deps.storage, rec);
       backfilledGroups += 1;
     } else if (rec.role === 'member' && !rec.sessionEnded) {
-      await saveGroupRecord(deps.storage, { ...rec, sessionEnded: true });
+      rec.sessionEnded = true;
+      await saveGroupRecord(deps.storage, rec);
       endedGroups += 1;
     }
   }

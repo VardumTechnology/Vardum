@@ -60,8 +60,20 @@ export function VeilQrSheet({ veilId, nickname, onShareLink, onClose }: {
       const { captureRef } = require('react-native-view-shot') as typeof import('react-native-view-shot');
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const Sharing = require('expo-sharing') as typeof import('expo-sharing');
-      const uri = await captureRef(shotRef, { format: 'png', quality: 1, result: 'tmpfile' });
-      await withSystemSheet(() => Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'My Vardum QR', UTI: 'public.png' }));
+      // b77u (audit 6 W11 / IH device F-02): never the library's tmpfile (iOS tmp/ReactNative/, Android's EXTERNAL
+      // cache, never released): the PNG goes into Vardum's swept temp folder and is deleted once shared
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { tmpPath, deleteQuietly } = require('../local-files') as typeof import('../local-files');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const FS = require('expo-file-system') as typeof import('expo-file-system');
+      const b64 = await captureRef(shotRef, { format: 'png', quality: 1, result: 'base64' });
+      const uri = await tmpPath(`vardum-qr-${Date.now()}.png`);
+      try {
+        await FS.writeAsStringAsync(uri, b64, { encoding: FS.EncodingType.Base64 });
+        await withSystemSheet(() => Sharing.shareAsync(uri, { mimeType: 'image/png', dialogTitle: 'My Vardum QR', UTI: 'public.png' }));
+      } finally {
+        await deleteQuietly(uri);
+      }
     } catch (e) {
       const m = String((e as Error)?.message ?? e);
       setPicErr(/native module|RNViewShot|cannot find|undefined is not/i.test(m) ? 'Sending as a picture needs the latest Vardum build. Send the link for now.' : 'That didn’t work — try again, or send the link.');

@@ -9,7 +9,10 @@
  * repro/tap-entry.ts). The ESM build instead loads a Deno shim that constructs
  * `new Proxy`, which Hermes cannot run. The vendored copy is plain ESM —
  * Metro-native — with the Deno/Node shim replaced by a direct globalThis.crypto
- * read (always installed first by src/polyfills.ts). Byte-identical ML-KEM math.
+ * read (always installed first by src/polyfills.ts). One further edit: mlKemBase.js
+ * adds the FIPS 203 §7.3 decapsulation-key hash check. b71: the copy is checked
+ * byte-for-byte against @noble/post-quantum (repro/mlkem_differential.test.ts) and
+ * against the NIST ACVP records (repro/b159_audit_vectors.test.ts).
  */
 
 import { toB64, fromB64 } from './bytes';

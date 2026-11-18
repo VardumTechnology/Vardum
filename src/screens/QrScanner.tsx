@@ -17,10 +17,20 @@ import { View, Text, TouchableOpacity, StyleSheet, Linking } from 'react-native'
 import * as ImagePicker from 'expo-image-picker';
 import { parseVeilAddLink } from '../qr';
 import { withSystemSheet } from '../lock-hold';
+import { deleteQuietly } from '../local-files'; // b77u (W11)
 
 type CameraModule = typeof import('expo-camera');
 
-export function QrScanner({ onFound, onClose }: { onFound: (veilId: string) => void; onClose: () => void }) {
+/** b71 (audit): the same scanner also reads a device-transfer QR — `accept` picks
+ *  what counts (default: a VEIL add link), and anything else is still ignored. */
+export interface QrScannerOptions {
+  accept?: (raw: string) => string | null;
+  title?: string;
+  hint?: string;
+  rejectNote?: string;
+}
+
+export function QrScanner({ onFound, onClose, accept = parseVeilAddLink, title = 'Scan a Vardum QR', hint = 'Point the camera at the other person’s Vardum QR.', rejectNote = 'That isn’t a Vardum QR. Point the camera at someone’s Vardum QR.' }: { onFound: (veilId: string) => void; onClose: () => void } & QrScannerOptions) {
   const cam = useMemo<CameraModule | null>(() => {
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -43,9 +53,9 @@ export function QrScanner({ onFound, onClose }: { onFound: (veilId: string) => v
 
   const onScan = ({ data, type }: { data: string; type?: string }) => {
     if (handled.current) return;
-    const id = parseVeilAddLink(String(data || ''));
-    console.log(`[veil-scan] code seen: type=${type} len=${String(data || '').length} start=${JSON.stringify(String(data || '').slice(0, 34))} veilId=${id ? 'yes' : 'no'}`);
-    if (!id) { setNote('That isn’t a Vardum QR. Point the camera at someone’s Vardum QR.'); return; }
+    const id = accept(String(data || ''));
+    console.log(`[veil-scan] code seen: type=${type} len=${String(data || '').length} start=${accept === parseVeilAddLink ? JSON.stringify(String(data || '').slice(0, 34)) : '(not logged)'} veilId=${id ? 'yes' : 'no'}`);
+    if (!id) { setNote(rejectNote); return; }
     handled.current = true;
     onFound(id);
   };
@@ -55,9 +65,11 @@ export function QrScanner({ onFound, onClose }: { onFound: (veilId: string) => v
     try {
       const r = await withSystemSheet(() => ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 1, allowsMultipleSelection: false }));
       if (r.canceled || !r.assets?.[0]?.uri) return;
-      const codes = await cam.scanFromURLAsync(r.assets[0].uri, ['qr']);
+      const picked = r.assets[0].uri;
+      // b77u (audit 6 W11, IH full "not reproduced": the QR picker copy in cache/ImagePicker): deleted once read
+      const codes = await cam.scanFromURLAsync(picked, ['qr']).finally(() => { void deleteQuietly(picked); });
       console.log(`[veil-scan] photo: ${codes.length} code(s) found`);
-      const hit = codes.find((c) => parseVeilAddLink(String(c.data || '')));
+      const hit = codes.find((c) => accept(String(c.data || '')));
       if (!hit) { setNote('No Vardum QR found in that picture. Choose the picture of someone’s Vardum QR.'); return; }
       onScan({ data: hit.data, type: 'photo' });
     } catch (e) {
@@ -79,13 +91,13 @@ export function QrScanner({ onFound, onClose }: { onFound: (veilId: string) => v
         />
       ) : null}
       <View style={styles.overlay} pointerEvents="box-none">
-        <Text style={styles.title}>Scan a Vardum QR</Text>
+        <Text style={styles.title}>{title}</Text>
         <Text style={styles.sub}>
           {!cam
             ? 'Scanning needs the latest Vardum build. Until then, scan with your phone’s Camera app — it opens Vardum for you.'
             : perm === 'denied'
               ? 'Vardum needs camera access to scan. Turn it on in Settings → Vardum → Camera.'
-              : 'Point the camera at the other person’s Vardum QR.'}
+              : hint}
         </Text>
         {cam && perm === 'granted' ? <View style={styles.frame} /> : <View style={styles.frameSpacer} />}
         {note ? <Text style={styles.note}>{note}</Text> : null}
